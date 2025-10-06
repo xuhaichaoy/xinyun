@@ -599,15 +599,18 @@ impl GameState {
         self.current_player = player_id;
         self.phase = GamePhase::Main;
         // 回合数现在由end_turn处理，这里不需要增加
-        self.ready_player(player_id);
+        // ready_player 现在由 RuleEngine::start_turn 在效果触发后调用
     }
 
     pub fn end_turn(&mut self) {
-        // 不调用advance_phase()，因为前端已经通过ensurePhase处理了阶段推进
+        // 先推进到End阶段，保持阶段转换的一致性
+        self.phase = GamePhase::End;
+
+        // 然后切换到下一个玩家
         if let Some(next_player) = self.opponent_of(self.current_player) {
             self.current_player = next_player;
             self.turn += 1; // 增加回合数
-            self.phase = GamePhase::Main; // 直接进入Main阶段
+            self.phase = GamePhase::Main; // 下一个玩家从Main阶段开始
                                           // 准备下一个玩家的回合（恢复法力、抽牌等）
             self.ready_player(next_player);
         }

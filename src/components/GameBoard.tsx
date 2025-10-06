@@ -15,7 +15,7 @@ import {
   type CardTargetSide,
 } from "@/data/cards";
 
-const BOARD_SLOT_COUNT = 7;
+const BOARD_SLOT_COUNT = 10;
 type StagePlayer = NonNullable<UseGameStateResult["state"]>["players"][number];
 
 interface GameBoardProps {
@@ -550,7 +550,11 @@ export const GameBoard = ({ gameStateHook, scenarioGuide }: GameBoardProps) => {
               guide={scenarioGuide}
             />
             {scenarioGuide && <ScenarioGuidePanel guide={scenarioGuide} />}
-            {import.meta.env.DEV && <EventDebugger limit={12} />}
+            {import.meta.env.DEV && (
+              <div className="sidebar-panel sidebar-panel--debug">
+                <EventDebugger limit={12} />
+              </div>
+            )}
           </aside>
 
           <div className="battle-layout__main">
@@ -822,47 +826,10 @@ const MatchSummary = ({
   opponentHandSize,
 }: MatchSummaryProps) => (
   <div className="match-summary" aria-label="对战概况">
-    <MatchSummaryPlayer
-      player={opponent}
-      label="对手"
-      active={currentPlayerId === opponent.id}
-      handSize={opponentHandSize}
-    />
     <div className="match-summary__state">
       <span>回合 {turn}</span>
       <span>阶段 {phase}</span>
     </div>
-    <MatchSummaryPlayer
-      player={player}
-      label="你"
-      active={currentPlayerId === player.id}
-      handSize={handSize}
-    />
-  </div>
-);
-
-interface MatchSummaryPlayerProps {
-  player: NonNullable<UseGameStateResult["state"]>["players"][number];
-  label: string;
-  active: boolean;
-  handSize: number;
-}
-
-const MatchSummaryPlayer = ({
-  player,
-  label,
-  active,
-  handSize,
-}: MatchSummaryPlayerProps) => (
-  <div className="match-summary__player" data-active={active}>
-    <span className="match-summary__label">
-      {label} #{player.id}
-    </span>
-    <span>❤ {player.health}</span>
-    <span>🛡 {player.armor}</span>
-    <span>🔷 {player.mana}</span>
-    <span>🂠 {player.deck?.length ?? 0}</span>
-    <span>🂡 {handSize}</span>
   </div>
 );
 
@@ -920,7 +887,27 @@ const Stage = memo((props: StageProps) => {
   return (
     <div className="stage" aria-label="战场">
       <div className="stage__board stage__board--top">
-        <HeroBadge player={opponent} position="top" active={!isPlayerTurn} />
+        <HeroBadge
+          player={opponent}
+          position="top"
+          active={!isPlayerTurn}
+          onClick={() => {
+            if (
+              selectedAttacker &&
+              !isMutating &&
+              isPlayerTurn &&
+              canInteract
+            ) {
+              onAttackTarget({ ownerId: opponent.id });
+            }
+          }}
+          clickable={
+            Boolean(selectedAttacker) &&
+            !isMutating &&
+            isPlayerTurn &&
+            canInteract
+          }
+        />
         <BoardLane
           cards={opponentBoard}
           ownerId={opponent.id}
@@ -931,29 +918,6 @@ const Stage = memo((props: StageProps) => {
           onCardClick={(card) => onAttackTarget({ ownerId: opponent.id, card })}
         />
       </div>
-
-      <ActionBanner
-        selectedAttacker={selectedAttacker}
-        interactionMessage={interactionMessage}
-        error={error}
-        events={events}
-        canAttackHero={
-          Boolean(selectedAttacker) &&
-          !isMutating &&
-          isPlayerTurn &&
-          canInteract
-        }
-        onAttackHero={onAttackHero}
-        onCancelSelection={() =>
-          selectedAttacker && onSelectAttacker(selectedAttacker)
-        }
-        guide={guide}
-        phase={phase}
-        isMulliganPhase={isMulliganPhase}
-        playerHasCompletedMulligan={playerHasCompletedMulligan}
-        opponentHasCompletedMulligan={opponentHasCompletedMulligan}
-        mulliganSelectionCount={mulliganSelectionCount}
-      />
 
       <div className="stage__board stage__board--bottom">
         <BoardLane
@@ -989,6 +953,9 @@ const BoardLane = ({
   disabled,
   selectedCardId,
 }: BoardLaneProps) => {
+  // 只显示一个空槽位作为占位符，或者不显示空槽位
+  const showEmptySlot = cards.length === 0;
+
   return (
     <div
       className="board-lane"
@@ -1005,10 +972,7 @@ const BoardLane = ({
           onClick={() => onCardClick(card)}
         />
       ))}
-      {cards.length < BOARD_SLOT_COUNT &&
-        Array.from({ length: BOARD_SLOT_COUNT - cards.length }).map(
-          (_, index) => <BoardSlot key={`${ownerId}-slot-${index}`} />
-        )}
+      {showEmptySlot && <BoardSlot key={`${ownerId}-slot-placeholder`} />}
     </div>
   );
 };
@@ -1019,10 +983,25 @@ interface HeroBadgeProps {
   player: NonNullable<UseGameStateResult["state"]>["players"][number];
   position: "top" | "bottom";
   active: boolean;
+  onClick?: () => void;
+  clickable?: boolean;
 }
 
-const HeroBadge = ({ player, position, active }: HeroBadgeProps) => (
-  <div className="hero-badge" data-position={position} data-active={active}>
+const HeroBadge = ({
+  player,
+  position,
+  active,
+  onClick,
+  clickable,
+}: HeroBadgeProps) => (
+  <div
+    className="hero-badge"
+    data-position={position}
+    data-active={active}
+    data-clickable={clickable}
+    onClick={onClick}
+    style={{ cursor: clickable ? "pointer" : "default" }}
+  >
     <div className="hero-badge__avatar" aria-hidden>
       <span>{position === "top" ? "敌" : "我"}</span>
     </div>
@@ -1037,130 +1016,6 @@ const HeroBadge = ({ player, position, active }: HeroBadgeProps) => (
     </div>
   </div>
 );
-
-interface ActionBannerProps {
-  selectedAttacker: Card | null;
-  interactionMessage: string | null;
-  error: Error | null;
-  events: GameEvent[];
-  canAttackHero: boolean;
-  onAttackHero: () => void;
-  onCancelSelection: () => void;
-  guide?: ScenarioGuide & {
-    name: string;
-    summary: string;
-    keyCardDetails: CardDefinition[];
-  };
-  phase: GamePhase;
-  isMulliganPhase: boolean;
-  playerHasCompletedMulligan: boolean;
-  opponentHasCompletedMulligan: boolean;
-  mulliganSelectionCount: number;
-}
-
-const ActionBanner = ({
-  selectedAttacker,
-  interactionMessage,
-  error,
-  events,
-  canAttackHero,
-  onAttackHero,
-  onCancelSelection,
-  guide,
-  phase,
-  isMulliganPhase,
-  playerHasCompletedMulligan,
-  opponentHasCompletedMulligan,
-  mulliganSelectionCount,
-}: ActionBannerProps) => {
-  const phaseLabelMap: Record<GamePhase, string> = {
-    Mulligan: "调度阶段",
-    Main: "主阶段",
-    Combat: "战斗阶段",
-    End: "结束阶段",
-  };
-  const phaseLabel = phaseLabelMap[phase] ?? phase;
-  const recentEvents =
-    events
-      .slice(-3)
-      .map((event) => event.type)
-      .join(" · ") || "无";
-
-  if (isMulliganPhase) {
-    const waitingForOpponent =
-      playerHasCompletedMulligan && !opponentHasCompletedMulligan;
-    return (
-      <div className="battlefield__banner">
-        <strong>{guide?.title ?? "起手调度"}</strong>
-        {guide && <p className="battlefield__objective">{guide.objective}</p>}
-        <p className="battlefield__phase-info">当前阶段：{phaseLabel}</p>
-        {!playerHasCompletedMulligan ? (
-          <p>
-            请选择想要替换的卡牌，当前已选择
-            <span className="battlefield__highlight">
-              {" "}
-              {mulliganSelectionCount}{" "}
-            </span>
-            张。完成选择后，请在弹出的窗口中确认换牌或保留全部。
-          </p>
-        ) : (
-          <p>
-            {waitingForOpponent
-              ? "调度已提交，正在等待对手…"
-              : "调度完成，等待进入主阶段"}
-          </p>
-        )}
-        {interactionMessage && (
-          <p className="battlefield__info">{interactionMessage}</p>
-        )}
-        {error && <p className="battlefield__error">{error.message}</p>}
-        <p className="battlefield__events">最近事件：{recentEvents}</p>
-      </div>
-    );
-  }
-
-  return (
-    <div className="battlefield__banner">
-      <strong>{guide?.title ?? "作战指引"}</strong>
-      {guide && <p className="battlefield__objective">{guide.objective}</p>}
-      <p className="battlefield__phase-info">当前阶段：{phaseLabel}</p>
-      {selectedAttacker ? (
-        <p>
-          当前选择：
-          <span className="battlefield__highlight">
-            {selectedAttacker.name}
-          </span>{" "}
-          · 选择攻击目标或点击英雄键。
-        </p>
-      ) : (
-        <p>从手牌中选择卡牌或点击己方随从发起攻击。</p>
-      )}
-      {interactionMessage && (
-        <p className="battlefield__info">{interactionMessage}</p>
-      )}
-      {error && <p className="battlefield__error">{error.message}</p>}
-      <p className="battlefield__events">最近事件：{recentEvents}</p>
-      <div className="battlefield__actions">
-        <button
-          type="button"
-          className="battlefield__action"
-          disabled={!canAttackHero}
-          onClick={onAttackHero}
-        >
-          攻击敌方英雄
-        </button>
-        <button
-          type="button"
-          className="battlefield__action"
-          disabled={!selectedAttacker}
-          onClick={onCancelSelection}
-        >
-          取消选择
-        </button>
-      </div>
-    </div>
-  );
-};
 
 interface HandZoneProps {
   cards: Card[];
@@ -1238,16 +1093,12 @@ interface QuickStatsProps {
 }
 
 const QuickStats = ({ turn, phase, events, guide }: QuickStatsProps) => {
-  const lastEvent =
-    events.length > 0 ? events[events.length - 1]?.type : undefined;
   return (
     <div className="quick-stats" aria-label="战况摘要">
       <h3>战况</h3>
       <span>回合 {turn}</span>
       <span>阶段 {phase}</span>
       <span>事件 {events.length}</span>
-      <span>最近：{lastEvent ?? "无"}</span>
-      {guide && <span>任务：{guide.title}</span>}
     </div>
   );
 };
@@ -1264,22 +1115,14 @@ const ScenarioGuidePanel = ({ guide }: ScenarioGuidePanelProps) => (
   <section className="guide-panel" aria-label="关卡指引">
     <header>
       <h3>{guide.name}</h3>
-      <p>{guide.summary}</p>
     </header>
     <div className="guide-panel__objective">
       <strong>目标</strong>
       <p>{guide.objective}</p>
     </div>
-    {guide.keyCardDetails.length > 0 && (
-      <div className="guide-panel__cards" aria-label="关键卡牌">
-        {guide.keyCardDetails.map((card) => (
-          <span key={card.slug}>{card.name}</span>
-        ))}
-      </div>
-    )}
     {guide.tips.length > 0 && (
       <ul className="guide-panel__tips">
-        {guide.tips.map((tip, index) => (
+        {guide.tips.slice(0, 2).map((tip, index) => (
           <li key={index}>{tip}</li>
         ))}
       </ul>

@@ -247,7 +247,9 @@ impl RuleEngine {
             });
         }
 
-        let pending_card_type = state.players[player_index].hand[hand_index].card_type.clone();
+        let pending_card_type = state.players[player_index].hand[hand_index]
+            .card_type
+            .clone();
         if pending_card_type == CardType::Unit
             && state.players[player_index].board.len() as u8 >= state.max_board_size
         {
@@ -454,11 +456,12 @@ impl RuleEngine {
         Self::ensure_integrity(state)?;
         Self::ensure_mulligan_phase(state)?;
 
-        let player_index = state
-            .player_index(action.player_id)
-            .ok_or(RuleError::PlayerNotFound {
-                player_id: action.player_id,
-            })?;
+        let player_index =
+            state
+                .player_index(action.player_id)
+                .ok_or(RuleError::PlayerNotFound {
+                    player_id: action.player_id,
+                })?;
 
         if state.mulligan_completed(action.player_id) {
             return Err(RuleError::MulliganAlreadyCompleted {
@@ -505,7 +508,8 @@ impl RuleEngine {
             if state.turn == 0 {
                 state.turn = 1;
             }
-            state.phase = GamePhase::Main;
+            // 不要直接跳到Main阶段，让正常的阶段流程处理
+            // 这样确保OnTurnStart效果能正确触发
         }
 
         Ok(events)
@@ -520,9 +524,14 @@ impl RuleEngine {
             return Err(RuleError::GameFinished);
         }
         Self::ensure_integrity(state)?;
-        state.start_turn(player_id);
+
+        // 设置当前玩家和阶段，但不立即准备玩家
+        state.current_player = player_id;
+        state.phase = GamePhase::Main;
 
         let mut events = Vec::new();
+
+        // 先触发OnTurnStart效果
         if let Some(index) = state.player_index(player_id) {
             let board_snapshot: Vec<Card> = state.players[index].board.clone();
             for card in &board_snapshot {
@@ -534,6 +543,9 @@ impl RuleEngine {
             let mut trigger_events = self.effect_engine.resolve_all(state);
             events.append(&mut trigger_events);
         }
+
+        // 然后才准备玩家（抽牌、恢复法力等）
+        state.ready_player(player_id);
 
         if let Some(outcome) = state.evaluate_victory() {
             events.push(GameEvent::GameWon {
@@ -612,10 +624,7 @@ mod tests {
         let mut engine = RuleEngine::new();
         let mut state = setup_state();
 
-        let initial_health = state
-            .get_player(1)
-            .expect("defender should exist")
-            .health;
+        let initial_health = state.get_player(1).expect("defender should exist").health;
 
         let action = AttackAction {
             attacker_owner: 0,
@@ -628,12 +637,12 @@ mod tests {
             .attack(&mut state, action)
             .expect("attack should succeed");
 
-        let updated_health = state
-            .get_player(1)
-            .expect("defender should exist")
-            .health;
+        let updated_health = state.get_player(1).expect("defender should exist").health;
 
-        assert!(updated_health < initial_health, "defender health should be reduced");
+        assert!(
+            updated_health < initial_health,
+            "defender health should be reduced"
+        );
     }
 
     #[test]
@@ -665,7 +674,10 @@ mod tests {
             .map(|card| card.health)
             .unwrap_or_default();
 
-        assert!(defender_after < defender_before, "defender unit health should drop");
+        assert!(
+            defender_after < defender_before,
+            "defender unit health should drop"
+        );
 
         let attacker_after = state
             .get_player(0)
@@ -673,6 +685,9 @@ mod tests {
             .map(|card| card.health)
             .unwrap_or_default();
 
-        assert!(attacker_after < 2, "attacker should also take retaliation damage");
+        assert!(
+            attacker_after < 2,
+            "attacker should also take retaliation damage"
+        );
     }
 }

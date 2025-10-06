@@ -28,8 +28,12 @@ export const GamePage = () => {
   const { updateProgress, unlockLevel, addAchievement } = persistence;
 
   const unlockedLevels = persistence.activeSlot.progress.unlockedLevels;
-  const fallbackLevelId = unlockedLevels.length > 0 ? unlockedLevels[unlockedLevels.length - 1] : 1;
-  const effectiveLevelId = typeof locationState?.levelId === "number" && locationState.levelId > 0 ? locationState.levelId : fallbackLevelId;
+  const fallbackLevelId =
+    unlockedLevels.length > 0 ? unlockedLevels[unlockedLevels.length - 1] : 1;
+  const effectiveLevelId =
+    typeof locationState?.levelId === "number" && locationState.levelId > 0
+      ? locationState.levelId
+      : fallbackLevelId;
 
   const levelConfig = useMemo(
     () => getLevelConfig(effectiveLevelId) ?? getLevelConfig(1),
@@ -37,10 +41,15 @@ export const GamePage = () => {
   );
 
   const scenario = useMemo(() => {
-    return buildScenarioByLevelId(effectiveLevelId) ?? buildScenarioByLevelId(1);
+    return (
+      buildScenarioByLevelId(effectiveLevelId) ?? buildScenarioByLevelId(1)
+    );
   }, [effectiveLevelId]);
 
-  const initialStateJson = useMemo(() => (scenario?.state ? JSON.stringify(scenario.state) : undefined), [scenario?.state]);
+  const initialStateJson = useMemo(
+    () => (scenario?.state ? JSON.stringify(scenario.state) : undefined),
+    [scenario?.state]
+  );
 
   useEffect(() => {
     let disposed = false;
@@ -70,20 +79,34 @@ export const GamePage = () => {
   }, [ready, module, initialStateJson]);
 
   const gameStateHook = useGameState({ service, updateMode: "incremental" });
-  const { state, events, isMutating, applyAiMove, mulligan, startTurn } = gameStateHook;
+  const { state, events, isMutating, applyAiMove, mulligan, startTurn } =
+    gameStateHook;
 
   const aiDifficulty = useMemo<AiDifficulty>(() => {
     const value = locationState?.difficulty;
-    if (value === "easy" || value === "normal" || value === "hard" || value === "expert") {
+    if (
+      value === "easy" ||
+      value === "normal" ||
+      value === "hard" ||
+      value === "expert"
+    ) {
       return value;
     }
     if (levelConfig) {
       return levelConfig.recommendedDifficulty;
     }
     return persistence.activeSlot.settings.aiDifficulty;
-  }, [levelConfig, locationState?.difficulty, persistence.activeSlot.settings.aiDifficulty]);
+  }, [
+    levelConfig,
+    locationState?.difficulty,
+    persistence.activeSlot.settings.aiDifficulty,
+  ]);
 
-  const aiTurnRef = useRef<string | null>(null);
+  const aiTurnRef = useRef<{
+    turn: number;
+    player: number;
+    timestamp: number;
+  } | null>(null);
   const outcomeHandledRef = useRef(false);
   const initialTurnStartedRef = useRef(false);
 
@@ -103,30 +126,36 @@ export const GamePage = () => {
     }
     const completed = new Set(state.mulligan_completed ?? []);
     if (!completed.has(aiPlayer.id)) {
-      void mulligan({ player_id: aiPlayer.id, replacements: [] }).catch((error) => {
-        console.error("AI mulligan failed", error);
-      });
+      void mulligan({ player_id: aiPlayer.id, replacements: [] }).catch(
+        (error) => {
+          console.error("AI mulligan failed", error);
+        }
+      );
     }
   }, [isMutating, mulligan, state]);
 
   useEffect(() => {
-    if (!state || state.phase !== "Main" || isMutating) {
-      if (state?.phase !== "Main") {
-        initialTurnStartedRef.current = false;
-      }
+    if (!state || isMutating) {
       return;
     }
+
+    const players = state.players ?? [];
+    const completed = state.mulligan_completed ?? [];
+
+    if (players.length === 0 || completed.length !== players.length) {
+      initialTurnStartedRef.current = false;
+      return;
+    }
+
     if (initialTurnStartedRef.current) {
       return;
     }
-    const completed = state.mulligan_completed ?? [];
-    if (state.players && completed.length === state.players.length) {
-      initialTurnStartedRef.current = true;
-      void startTurn(state.current_player).catch((error) => {
-        console.error("Failed to start initial turn", error);
-        initialTurnStartedRef.current = false;
-      });
-    }
+
+    initialTurnStartedRef.current = true;
+    void startTurn(state.current_player).catch((error) => {
+      console.error("Failed to start initial turn", error);
+      initialTurnStartedRef.current = false;
+    });
   }, [isMutating, startTurn, state]);
 
   useEffect(() => {
@@ -145,16 +174,31 @@ export const GamePage = () => {
       return;
     }
 
-    const marker = `${state.turn}-${state.current_player}-${events.length}`;
-    if (aiTurnRef.current === marker) {
+    const current = {
+      turn: state.turn,
+      player: state.current_player,
+      timestamp: Date.now(),
+    };
+    const last = aiTurnRef.current;
+
+    // 防止同一回合同一玩家的重复执行
+    if (last && last.turn === current.turn && last.player === current.player) {
       return;
     }
-    aiTurnRef.current = marker;
+
+    // 防止过于频繁的AI决策（至少间隔100ms）
+    if (last && current.timestamp - last.timestamp < 100) {
+      return;
+    }
+
+    aiTurnRef.current = current;
 
     void applyAiMove(aiPlayer.id, { difficulty: aiDifficulty }).catch((err) => {
       console.error("AI move failed", err);
+      // 失败时重置标记，允许重试
+      aiTurnRef.current = null;
     });
-  }, [aiDifficulty, applyAiMove, events.length, isMutating, state]);
+  }, [aiDifficulty, applyAiMove, isMutating, state]);
 
   useEffect(() => {
     const outcome = state?.outcome;
@@ -182,7 +226,10 @@ export const GamePage = () => {
           const candidate = levelId + 1;
           return getLevelConfig(candidate) ? candidate : undefined;
         })();
-        if (typeof unlockTarget === "number" && !unlockedLevels.includes(unlockTarget)) {
+        if (
+          typeof unlockTarget === "number" &&
+          !unlockedLevels.includes(unlockTarget)
+        ) {
           unlockLevel(unlockTarget);
           unlockedLevelId = unlockTarget;
         }
@@ -199,7 +246,17 @@ export const GamePage = () => {
         unlockedLevelId,
       },
     });
-  }, [addAchievement, effectiveLevelId, events, levelConfig, navigate, state, unlockLevel, unlockedLevels, updateProgress]);
+  }, [
+    addAchievement,
+    effectiveLevelId,
+    events,
+    levelConfig,
+    navigate,
+    state,
+    unlockLevel,
+    unlockedLevels,
+    updateProgress,
+  ]);
 
   const loadingMessage = useMemo(() => {
     if (!ready) return "正在加载 WASM 模块…";
@@ -218,7 +275,10 @@ export const GamePage = () => {
 
   return (
     <>
-      <GameBoard gameStateHook={gameStateHook} scenarioGuide={scenario?.guide} />
+      <GameBoard
+        gameStateHook={gameStateHook}
+        scenarioGuide={scenario?.guide}
+      />
       {import.meta.env.DEV && <DebugOverlay gameStateHook={gameStateHook} />}
     </>
   );

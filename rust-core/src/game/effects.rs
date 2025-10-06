@@ -56,13 +56,11 @@ pub enum EffectCondition {
 impl EffectCondition {
     pub fn is_satisfied(&self, ctx: &EffectContext, state: &GameState) -> bool {
         match self {
-            EffectCondition::PlayerHealthBelow { target, threshold } => {
-                target
-                    .resolve_player(ctx, state)
-                    .and_then(|id| state.get_player(id))
-                    .map(|player| player.health < *threshold)
-                    .unwrap_or(false)
-            }
+            EffectCondition::PlayerHealthBelow { target, threshold } => target
+                .resolve_player(ctx, state)
+                .and_then(|id| state.get_player(id))
+                .map(|player| player.health < *threshold)
+                .unwrap_or(false),
             EffectCondition::PlayerManaAtLeast { target, amount } => target
                 .resolve_player(ctx, state)
                 .and_then(|id| state.get_player(id))
@@ -116,9 +114,9 @@ impl EffectKind {
                 .and_then(|id| state.get_player(id))
                 .map(|player| !player.deck.is_empty())
                 .unwrap_or(false),
-            EffectKind::Composite { effects } => effects
-                .iter()
-                .any(|effect| effect.can_trigger(ctx, state)),
+            EffectKind::Composite { effects } => {
+                effects.iter().any(|effect| effect.can_trigger(ctx, state))
+            }
             EffectKind::Conditional { condition, effect } => {
                 condition.is_satisfied(ctx, state) && effect.can_trigger(ctx, state)
             }
@@ -141,9 +139,12 @@ impl EffectKind {
                         events.extend(res);
                     }
                 } else if let Some(target_player) = target.resolve_player(ctx, state) {
-                    if let Some(event) =
-                        state.damage_player(ctx.source_player, ctx.source_card, target_player, *amount)
-                    {
+                    if let Some(event) = state.damage_player(
+                        ctx.source_player,
+                        ctx.source_card,
+                        target_player,
+                        *amount,
+                    ) {
                         events.push(event);
                     }
                 }
@@ -153,9 +154,7 @@ impl EffectKind {
                 let mut events = Vec::new();
                 if let Some(card_id) = ctx.target_card {
                     if let Some(target_owner) = ctx.target_player {
-                        if let Some(event) =
-                            state.heal_card(target_owner, card_id, *amount)
-                        {
+                        if let Some(event) = state.heal_card(target_owner, card_id, *amount) {
                             events.push(event);
                         }
                     }
@@ -339,7 +338,16 @@ impl EffectEngine {
 
     pub fn resolve_all(&mut self, state: &mut GameState) -> Vec<GameEvent> {
         let mut events = Vec::new();
+        let mut depth = 0;
+        const MAX_DEPTH: usize = 100; // 防止无限递归
+
         while let Some(item) = self.stack.pop() {
+            if depth >= MAX_DEPTH {
+                eprintln!("Effect stack depth limit reached ({}), stopping resolution to prevent infinite recursion", MAX_DEPTH);
+                break;
+            }
+            depth += 1;
+
             if !item.effect.can_trigger(&item.context, state) {
                 continue;
             }
@@ -348,8 +356,12 @@ impl EffectEngine {
             for event in &resolution.events {
                 state.record_event(event.clone());
                 if let GameEvent::CardDestroyed { player_id, card } = event {
-                    let death_ctx = EffectContext::new(EffectTrigger::OnDeath, *player_id, state.current_player)
-                        .with_source_card(card.id);
+                    let death_ctx = EffectContext::new(
+                        EffectTrigger::OnDeath,
+                        *player_id,
+                        state.current_player,
+                    )
+                    .with_source_card(card.id);
                     self.queue_card_effects(card, death_ctx);
                 }
             }
