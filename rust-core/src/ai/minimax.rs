@@ -8,8 +8,8 @@ use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 
 use crate::game::{
-    AttackAction, Card, CardId, CardType, EffectKind, EffectTarget, GameEvent, GameState,
-    MulliganAction, PlayCardAction, PlayerId, RuleEngine, RuleError, RuleResolution,
+    AttackAction, Card, CardId, CardType, GameEvent, GameState, MulliganAction, PlayCardAction,
+    PlayerId, RuleEngine, RuleError, RuleResolution,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -866,10 +866,7 @@ fn adaptive_weights(hero_diff: f64, board_diff: f64) -> StrategyWeights {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::game::{
-        Card, CardEffect, CardType, EffectKind, EffectTarget, EffectTrigger, GameState, Player,
-        VictoryReason,
-    };
+    use crate::game::{GameState, VictoryReason};
 
     #[test]
     fn ai_handles_finished_game() {

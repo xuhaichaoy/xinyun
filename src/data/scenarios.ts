@@ -293,7 +293,10 @@ export const buildScenarioByLevelId = (
     players: [playerData.player, opponentData.player],
     current_player: 0,
     turn: 1,
-    phase: "Main",
+    phase: "Mulligan",
+    max_hand_size: 10,
+    max_board_size: 7,
+    mulligan_completed: [],
     event_log: [],
   };
 

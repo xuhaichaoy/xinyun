@@ -44,6 +44,14 @@ function renderEvent(event: GameEvent): string {
     }
     case "CardDestroyed":
       return `玩家 #${event.player_id} 的卡牌 #${event.card.id} 被摧毁`;
+    case "CardBurned":
+      return `玩家 #${event.player_id} 的卡牌 ${event.card.name} 因手牌溢出被焚毁`;
+    case "MulliganApplied": {
+      if (event.replaced.length === 0) {
+        return `玩家 #${event.player_id} 保留了全部起手牌`;
+      }
+      return `玩家 #${event.player_id} 重抽了 ${event.replaced.length} 张起手牌`;
+    }
     case "CardHealed": {
       const target = event.card_id != null ? `卡牌 #${event.card_id}` : "英雄";
       return `玩家 #${event.player_id} 的 ${target} 恢复了 ${event.amount} 点生命`;

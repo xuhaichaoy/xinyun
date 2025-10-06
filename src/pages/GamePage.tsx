@@ -27,15 +27,18 @@ export const GamePage = () => {
   const persistence = useGamePersistence();
   const { updateProgress, unlockLevel, addAchievement } = persistence;
 
+  const unlockedLevels = persistence.activeSlot.progress.unlockedLevels;
+  const fallbackLevelId = unlockedLevels.length > 0 ? unlockedLevels[unlockedLevels.length - 1] : 1;
+  const effectiveLevelId = typeof locationState?.levelId === "number" && locationState.levelId > 0 ? locationState.levelId : fallbackLevelId;
+
   const levelConfig = useMemo(
-    () => (typeof locationState?.levelId === "number" ? getLevelConfig(locationState.levelId) : undefined),
-    [locationState?.levelId]
+    () => getLevelConfig(effectiveLevelId) ?? getLevelConfig(1),
+    [effectiveLevelId]
   );
 
   const scenario = useMemo(() => {
-    const id = levelConfig?.id ?? locationState?.levelId ?? 1;
-    return buildScenarioByLevelId(id);
-  }, [levelConfig?.id, locationState?.levelId]);
+    return buildScenarioByLevelId(effectiveLevelId) ?? buildScenarioByLevelId(1);
+  }, [effectiveLevelId]);
 
   const initialStateJson = useMemo(() => (scenario?.state ? JSON.stringify(scenario.state) : undefined), [scenario?.state]);
 
@@ -67,7 +70,7 @@ export const GamePage = () => {
   }, [ready, module, initialStateJson]);
 
   const gameStateHook = useGameState({ service, updateMode: "incremental" });
-  const { state, events, isMutating, applyAiMove } = gameStateHook;
+  const { state, events, isMutating, applyAiMove, mulligan, startTurn } = gameStateHook;
 
   const aiDifficulty = useMemo<AiDifficulty>(() => {
     const value = locationState?.difficulty;
@@ -82,11 +85,49 @@ export const GamePage = () => {
 
   const aiTurnRef = useRef<string | null>(null);
   const outcomeHandledRef = useRef(false);
+  const initialTurnStartedRef = useRef(false);
 
   useEffect(() => {
     aiTurnRef.current = null;
     outcomeHandledRef.current = false;
+    initialTurnStartedRef.current = false;
   }, [initialStateJson]);
+
+  useEffect(() => {
+    if (!state || state.phase !== "Mulligan" || isMutating) {
+      return;
+    }
+    const aiPlayer = state.players?.[1];
+    if (!aiPlayer) {
+      return;
+    }
+    const completed = new Set(state.mulligan_completed ?? []);
+    if (!completed.has(aiPlayer.id)) {
+      void mulligan({ player_id: aiPlayer.id, replacements: [] }).catch((error) => {
+        console.error("AI mulligan failed", error);
+      });
+    }
+  }, [isMutating, mulligan, state]);
+
+  useEffect(() => {
+    if (!state || state.phase !== "Main" || isMutating) {
+      if (state?.phase !== "Main") {
+        initialTurnStartedRef.current = false;
+      }
+      return;
+    }
+    if (initialTurnStartedRef.current) {
+      return;
+    }
+    const completed = state.mulligan_completed ?? [];
+    if (state.players && completed.length === state.players.length) {
+      initialTurnStartedRef.current = true;
+      void startTurn(state.current_player).catch((error) => {
+        console.error("Failed to start initial turn", error);
+        initialTurnStartedRef.current = false;
+      });
+    }
+  }, [isMutating, startTurn, state]);
 
   useEffect(() => {
     if (!state || state.outcome) {
@@ -127,22 +168,38 @@ export const GamePage = () => {
     }
     outcomeHandledRef.current = true;
 
-    const levelId = locationState?.levelId;
+    const levelId = effectiveLevelId;
     const players = state.players ?? [];
     const humanPlayer = players[0];
+    let unlockedLevelId: number | null = null;
     if (humanPlayer && outcome.winner === humanPlayer.id) {
       if (typeof levelId === "number") {
-        const unlockTarget = levelConfig?.unlockOnWin ?? levelId + 1;
         updateProgress({ lastCompletedLevel: levelId });
-        if (unlockTarget) {
+        const unlockTarget = (() => {
+          if (levelConfig?.unlockOnWin && levelConfig.unlockOnWin > 0) {
+            return levelConfig.unlockOnWin;
+          }
+          const candidate = levelId + 1;
+          return getLevelConfig(candidate) ? candidate : undefined;
+        })();
+        if (typeof unlockTarget === "number" && !unlockedLevels.includes(unlockTarget)) {
           unlockLevel(unlockTarget);
+          unlockedLevelId = unlockTarget;
         }
         addAchievement(`clear-level-${levelId}`);
       }
     }
 
-    navigate("/results", { replace: true, state: { outcome, events: events.slice(-10) } });
-  }, [addAchievement, events, levelConfig?.unlockOnWin, locationState?.levelId, navigate, state?.outcome, state?.players, unlockLevel, updateProgress]);
+    navigate("/results", {
+      replace: true,
+      state: {
+        outcome,
+        events: events.slice(-10),
+        levelId,
+        unlockedLevelId,
+      },
+    });
+  }, [addAchievement, effectiveLevelId, events, levelConfig, navigate, state, unlockLevel, unlockedLevels, updateProgress]);
 
   const loadingMessage = useMemo(() => {
     if (!ready) return "正在加载 WASM 模块…";

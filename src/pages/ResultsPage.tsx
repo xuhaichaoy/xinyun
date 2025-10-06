@@ -1,17 +1,21 @@
 import { useEffect } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 
-import type { AiDecision, GameEvent, VictoryState } from "@/types/domain";
+import type { GameEvent, VictoryState } from "@/types/domain";
+import { getLevelConfig } from "@/data/levels";
 
 interface ResultsLocationState {
   outcome?: VictoryState;
   events?: GameEvent[];
+  levelId?: number;
+  unlockedLevelId?: number | null;
 }
 
 export const ResultsPage = () => {
   const location = useLocation();
   const navigate = useNavigate();
   const state = (location.state as ResultsLocationState | undefined) ?? {};
+  const levelConfig = state.levelId ? getLevelConfig(state.levelId) : undefined;
 
   useEffect(() => {
     if (!state.outcome) {
@@ -33,7 +37,15 @@ export const ResultsPage = () => {
           <div className="game-board__surface" style={{ alignContent: "center", padding: 16 }}>
             <div>
               <h2 style={{ marginTop: 0 }}>玩家 #{state.outcome.winner} 获胜</h2>
+              {state.levelId && (
+                <p>
+                  完成关卡：{levelConfig?.name ? `${levelConfig.name} (#${state.levelId})` : `#${state.levelId}`}
+                </p>
+              )}
               <p>原因：{renderReason(state.outcome)}</p>
+              {typeof state.unlockedLevelId === "number" && (
+                <p>已解锁新关卡：#{state.unlockedLevelId}</p>
+              )}
             </div>
           </div>
           <aside className="game-log" aria-label="近期事件">

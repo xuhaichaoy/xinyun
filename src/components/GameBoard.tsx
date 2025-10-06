@@ -109,7 +109,9 @@ export const GameBoard = ({ gameStateHook, scenarioGuide }: GameBoardProps) => {
   );
 
   const [showSettings, setShowSettings] = useState(false);
-  const [mulliganSelection, setMulliganSelection] = useState<Set<number>>(new Set());
+  const [mulliganSelection, setMulliganSelection] = useState<Set<number>>(
+    new Set()
+  );
   const [selectedAttacker, setSelectedAttacker] = useState<Card | null>(null);
   const [interactionMessage, setInteractionMessage] = useState<string | null>(
     null
@@ -132,8 +134,16 @@ export const GameBoard = ({ gameStateHook, scenarioGuide }: GameBoardProps) => {
   useEffect(() => {
     if (!isMulliganPhase) {
       setMulliganSelection(new Set());
+      return;
     }
-  }, [isMulliganPhase]);
+    if (playerHasCompletedMulligan && !opponentHasCompletedMulligan) {
+      setInteractionMessage("等待对手完成调度…");
+    }
+  }, [
+    isMulliganPhase,
+    opponentHasCompletedMulligan,
+    playerHasCompletedMulligan,
+  ]);
 
   useEffect(() => {
     if (isMulliganPhase && playerHasCompletedMulligan) {
@@ -141,8 +151,21 @@ export const GameBoard = ({ gameStateHook, scenarioGuide }: GameBoardProps) => {
     }
   }, [isMulliganPhase, playerHasCompletedMulligan]);
 
+  useEffect(() => {
+    if (!isMulliganPhase || playerHasCompletedMulligan) {
+      return;
+    }
+    setInteractionMessage((prev) =>
+      prev && !prev.includes("等待") ? prev : "选择想要替换的起手牌并确认"
+    );
+  }, [isMulliganPhase, playerHasCompletedMulligan]);
+
   const handleEndTurn = useCallback(async () => {
     if (!player || !opponent || !state) {
+      return;
+    }
+    if (isMulliganPhase && !playerHasCompletedMulligan) {
+      setInteractionMessage("调度阶段无法结束回合");
       return;
     }
     try {
@@ -152,7 +175,15 @@ export const GameBoard = ({ gameStateHook, scenarioGuide }: GameBoardProps) => {
     } catch (err) {
       setInteractionMessage(err instanceof Error ? err.message : String(err));
     }
-  }, [ensurePhase, endTurn, player, opponent, state]);
+  }, [
+    ensurePhase,
+    endTurn,
+    isMulliganPhase,
+    player,
+    playerHasCompletedMulligan,
+    opponent,
+    state,
+  ]);
 
   useEffect(() => {
     if (!isPlayerTurn) {
@@ -259,6 +290,11 @@ export const GameBoard = ({ gameStateHook, scenarioGuide }: GameBoardProps) => {
       if (!player || !opponent || !isPlayerTurn || isMutating) {
         return;
       }
+      resetSelections();
+      if (isMulliganPhase && !playerHasCompletedMulligan) {
+        setInteractionMessage("请先完成调度阶段");
+        return;
+      }
       if (player.mana < card.cost) {
         setInteractionMessage(`法力不足，当前 ${player.mana}/${card.cost}`);
         return;
@@ -303,6 +339,8 @@ export const GameBoard = ({ gameStateHook, scenarioGuide }: GameBoardProps) => {
             message = "当前阶段不允许出牌";
           } else if (message.includes("NotPlayerTurn")) {
             message = "现在不是你的回合";
+          } else if (message.includes("BoardFull")) {
+            message = "战场已满，无法召唤更多随从";
           } else if (message.includes("CardNotFound")) {
             message = "卡牌不存在或已被移除";
           }
@@ -318,15 +356,79 @@ export const GameBoard = ({ gameStateHook, scenarioGuide }: GameBoardProps) => {
       ensurePhase,
       playCard,
       isMutating,
+      isMulliganPhase,
+      playerHasCompletedMulligan,
       isPlayerTurn,
       opponent,
       player,
+      resetSelections,
     ]
+  );
+
+  const applyMulligan = useCallback(
+    async (replacements: number[]) => {
+      if (
+        !player ||
+        !isMulliganPhase ||
+        playerHasCompletedMulligan ||
+        isMutating
+      ) {
+        return;
+      }
+      try {
+        setInteractionMessage(
+          replacements.length > 0 ? "重新发牌中…" : "保留全部手牌"
+        );
+        await mulligan({ player_id: player.id, replacements });
+        setMulliganSelection(new Set());
+        if (replacements.length > 0) {
+          setInteractionMessage("已替换所选手牌");
+        } else {
+          setInteractionMessage("保留全部手牌");
+        }
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        let display = message;
+        if (message.includes("MulliganAlreadyCompleted")) {
+          display = "本方调度已完成";
+        } else if (message.includes("MulliganPhaseOnly")) {
+          display = "该操作仅允许在调度阶段执行";
+        }
+        setInteractionMessage(display);
+      }
+    },
+    [isMulliganPhase, isMutating, mulligan, player, playerHasCompletedMulligan]
+  );
+
+  const handleConfirmMulligan = useCallback(() => {
+    void applyMulligan(Array.from(mulliganSelection));
+  }, [applyMulligan, mulliganSelection]);
+
+  const handleSkipMulligan = useCallback(() => {
+    void applyMulligan([]);
+  }, [applyMulligan]);
+
+  const handleToggleMulliganCard = useCallback(
+    (card: Card) => {
+      if (!isMulliganPhase || playerHasCompletedMulligan || isMutating) {
+        return;
+      }
+      setMulliganSelection((prev) => {
+        const next = new Set(prev);
+        if (next.has(card.id)) {
+          next.delete(card.id);
+        } else {
+          next.add(card.id);
+        }
+        return next;
+      });
+    },
+    [isMulliganPhase, isMutating, playerHasCompletedMulligan]
   );
 
   const handleSelectAttacker = useCallback(
     (card: Card) => {
-      if (!player || !isPlayerTurn || isMutating) {
+      if (!player || !isPlayerTurn || isMutating || isMulliganPhase) {
         return;
       }
       if (card.exhausted) {
@@ -338,7 +440,7 @@ export const GameBoard = ({ gameStateHook, scenarioGuide }: GameBoardProps) => {
         prev && prev.id === card.id ? null : card
       );
     },
-    [isMutating, isPlayerTurn, player]
+    [isMutating, isMulliganPhase, isPlayerTurn, player]
   );
 
   const handleAttackTarget = useCallback(
@@ -348,6 +450,7 @@ export const GameBoard = ({ gameStateHook, scenarioGuide }: GameBoardProps) => {
         !opponent ||
         !selectedAttacker ||
         !isPlayerTurn ||
+        isMulliganPhase ||
         isMutating
       ) {
         return;
@@ -399,6 +502,7 @@ export const GameBoard = ({ gameStateHook, scenarioGuide }: GameBoardProps) => {
       advancePhase,
       attack,
       isMutating,
+      isMulliganPhase,
       isPlayerTurn,
       opponent,
       player,
@@ -432,6 +536,7 @@ export const GameBoard = ({ gameStateHook, scenarioGuide }: GameBoardProps) => {
   const playerBoard = player.board ?? [];
   const opponentBoard = opponent.board ?? [];
   const playerHand = player.hand ?? [];
+  const canInteract = !isMulliganPhase || playerHasCompletedMulligan;
 
   return (
     <div className="game-app">
@@ -471,13 +576,18 @@ export const GameBoard = ({ gameStateHook, scenarioGuide }: GameBoardProps) => {
               isMutating={isMutating}
               guide={scenarioGuide}
               phase={state.phase}
+              canInteract={canInteract}
+              isMulliganPhase={isMulliganPhase}
+              playerHasCompletedMulligan={playerHasCompletedMulligan}
+              opponentHasCompletedMulligan={opponentHasCompletedMulligan}
+              mulliganSelectionCount={mulliganSelection.size}
               onSelectAttacker={handleSelectAttacker}
               onAttackTarget={handleAttackTarget}
               onAttackHero={() => handleAttackTarget({ ownerId: opponent.id })}
             />
             <HandZone
               cards={playerHand}
-              disabled={!isPlayerTurn || isMutating}
+              disabled={!isPlayerTurn || isMutating || !canInteract}
               onPlayCard={handlePlayCard}
               playerMana={player.mana}
             />
@@ -488,7 +598,7 @@ export const GameBoard = ({ gameStateHook, scenarioGuide }: GameBoardProps) => {
               <ActionPanel
                 onEndTurn={handleEndTurn}
                 onSettings={toggleSettings}
-                disabled={isMutating}
+                disabled={isMutating || !canInteract}
               />
             </div>
             <div className="sidebar-panel">
@@ -553,6 +663,17 @@ export const GameBoard = ({ gameStateHook, scenarioGuide }: GameBoardProps) => {
           }}
         />
       )}
+      {isMulliganPhase && !playerHasCompletedMulligan && (
+        <MulliganOverlay
+          cards={playerHand}
+          selection={mulliganSelection}
+          onToggle={handleToggleMulliganCard}
+          onConfirm={handleConfirmMulligan}
+          onSkip={handleSkipMulligan}
+          maxHandSize={state.max_hand_size ?? 10}
+          disabled={isMutating}
+        />
+      )}
     </div>
   );
 };
@@ -611,6 +732,69 @@ const TargetOverlay = ({ request, onSelect, onClose }: TargetOverlayProps) => {
             onClick={onClose}
           >
             取消
+          </button>
+        </footer>
+      </div>
+    </div>
+  );
+};
+
+interface MulliganOverlayProps {
+  cards: Card[];
+  selection: Set<number>;
+  onToggle: (card: Card) => void;
+  onConfirm: () => void;
+  onSkip: () => void;
+  maxHandSize: number;
+  disabled: boolean;
+}
+
+const MulliganOverlay = ({
+  cards,
+  selection,
+  onToggle,
+  onConfirm,
+  onSkip,
+  maxHandSize,
+  disabled,
+}: MulliganOverlayProps) => {
+  return (
+    <div className="mulligan-overlay" role="dialog" aria-modal="true">
+      <div className="mulligan-overlay__panel">
+        <header className="mulligan-overlay__header">
+          <h3>调度起手</h3>
+          <p>选择想要替换的手牌（当前最多 {maxHandSize} 张）。</p>
+        </header>
+        <div className="mulligan-overlay__cards">
+          {cards.map((card) => (
+            <CardSummary
+              key={card.id}
+              card={card}
+              variant="hand"
+              selected={selection.has(card.id)}
+              disabled={disabled}
+              onClick={() => !disabled && onToggle(card)}
+              playerMana={99}
+            />
+          ))}
+        </div>
+        <p className="mulligan-overlay__note">已选择 {selection.size} 张</p>
+        <footer className="mulligan-overlay__actions">
+          <button
+            type="button"
+            className="mulligan-overlay__button mulligan-overlay__button--primary"
+            onClick={onConfirm}
+            disabled={disabled}
+          >
+            确认换牌
+          </button>
+          <button
+            type="button"
+            className="mulligan-overlay__button"
+            onClick={onSkip}
+            disabled={disabled}
+          >
+            保留全部
           </button>
         </footer>
       </div>
@@ -694,6 +878,11 @@ interface StageProps {
   events: GameEvent[];
   isMutating: boolean;
   phase: GamePhase;
+  canInteract: boolean;
+  isMulliganPhase: boolean;
+  playerHasCompletedMulligan: boolean;
+  opponentHasCompletedMulligan: boolean;
+  mulliganSelectionCount: number;
   guide?: ScenarioGuide & {
     keyCardDetails: CardDefinition[];
     name: string;
@@ -717,6 +906,11 @@ const Stage = memo((props: StageProps) => {
     events,
     isMutating,
     phase,
+    canInteract,
+    isMulliganPhase,
+    playerHasCompletedMulligan,
+    opponentHasCompletedMulligan,
+    mulliganSelectionCount,
     onSelectAttacker,
     onAttackTarget,
     onAttackHero,
@@ -731,7 +925,9 @@ const Stage = memo((props: StageProps) => {
           cards={opponentBoard}
           ownerId={opponent.id}
           variant="opponent"
-          disabled={!selectedAttacker || isMutating || !isPlayerTurn}
+          disabled={
+            !selectedAttacker || isMutating || !isPlayerTurn || !canInteract
+          }
           onCardClick={(card) => onAttackTarget({ ownerId: opponent.id, card })}
         />
       </div>
@@ -741,13 +937,22 @@ const Stage = memo((props: StageProps) => {
         interactionMessage={interactionMessage}
         error={error}
         events={events}
-        canAttackHero={Boolean(selectedAttacker) && !isMutating && isPlayerTurn}
+        canAttackHero={
+          Boolean(selectedAttacker) &&
+          !isMutating &&
+          isPlayerTurn &&
+          canInteract
+        }
         onAttackHero={onAttackHero}
         onCancelSelection={() =>
           selectedAttacker && onSelectAttacker(selectedAttacker)
         }
         guide={guide}
         phase={phase}
+        isMulliganPhase={isMulliganPhase}
+        playerHasCompletedMulligan={playerHasCompletedMulligan}
+        opponentHasCompletedMulligan={opponentHasCompletedMulligan}
+        mulliganSelectionCount={mulliganSelectionCount}
       />
 
       <div className="stage__board stage__board--bottom">
@@ -756,7 +961,7 @@ const Stage = memo((props: StageProps) => {
           ownerId={player.id}
           variant="player"
           selectedCardId={selectedAttacker?.id ?? null}
-          disabled={!isPlayerTurn || isMutating}
+          disabled={!isPlayerTurn || isMutating || !canInteract}
           onCardClick={onSelectAttacker}
         />
         <HeroBadge player={player} position="bottom" active={isPlayerTurn} />
@@ -847,6 +1052,10 @@ interface ActionBannerProps {
     keyCardDetails: CardDefinition[];
   };
   phase: GamePhase;
+  isMulliganPhase: boolean;
+  playerHasCompletedMulligan: boolean;
+  opponentHasCompletedMulligan: boolean;
+  mulliganSelectionCount: number;
 }
 
 const ActionBanner = ({
@@ -859,53 +1068,99 @@ const ActionBanner = ({
   onCancelSelection,
   guide,
   phase,
-}: ActionBannerProps) => (
-  <div className="battlefield__banner">
-    <strong>{guide?.title ?? "作战指引"}</strong>
-    {guide && <p className="battlefield__objective">{guide.objective}</p>}
-    <p className="battlefield__phase-info">当前阶段：{phase}</p>
-    {selectedAttacker ? (
-      <p>
-        当前选择：
-        <span className="battlefield__highlight">
-          {selectedAttacker.name}
-        </span>{" "}
-        · 选择攻击目标或点击英雄键。
-      </p>
-    ) : (
-      <p>从手牌中选择卡牌或点击己方随从发起攻击。</p>
-    )}
-    {interactionMessage && (
-      <p className="battlefield__info">{interactionMessage}</p>
-    )}
-    {error && <p className="battlefield__error">{error.message}</p>}
-    <p className="battlefield__events">
-      最近事件：
-      {events
-        .slice(-3)
-        .map((event) => event.type)
-        .join(" · ") || "无"}
-    </p>
-    <div className="battlefield__actions">
-      <button
-        type="button"
-        className="battlefield__action"
-        disabled={!canAttackHero}
-        onClick={onAttackHero}
-      >
-        攻击敌方英雄
-      </button>
-      <button
-        type="button"
-        className="battlefield__action"
-        disabled={!selectedAttacker}
-        onClick={onCancelSelection}
-      >
-        取消选择
-      </button>
+  isMulliganPhase,
+  playerHasCompletedMulligan,
+  opponentHasCompletedMulligan,
+  mulliganSelectionCount,
+}: ActionBannerProps) => {
+  const phaseLabelMap: Record<GamePhase, string> = {
+    Mulligan: "调度阶段",
+    Main: "主阶段",
+    Combat: "战斗阶段",
+    End: "结束阶段",
+  };
+  const phaseLabel = phaseLabelMap[phase] ?? phase;
+  const recentEvents =
+    events
+      .slice(-3)
+      .map((event) => event.type)
+      .join(" · ") || "无";
+
+  if (isMulliganPhase) {
+    const waitingForOpponent =
+      playerHasCompletedMulligan && !opponentHasCompletedMulligan;
+    return (
+      <div className="battlefield__banner">
+        <strong>{guide?.title ?? "起手调度"}</strong>
+        {guide && <p className="battlefield__objective">{guide.objective}</p>}
+        <p className="battlefield__phase-info">当前阶段：{phaseLabel}</p>
+        {!playerHasCompletedMulligan ? (
+          <p>
+            请选择想要替换的卡牌，当前已选择
+            <span className="battlefield__highlight">
+              {" "}
+              {mulliganSelectionCount}{" "}
+            </span>
+            张。完成选择后，请在弹出的窗口中确认换牌或保留全部。
+          </p>
+        ) : (
+          <p>
+            {waitingForOpponent
+              ? "调度已提交，正在等待对手…"
+              : "调度完成，等待进入主阶段"}
+          </p>
+        )}
+        {interactionMessage && (
+          <p className="battlefield__info">{interactionMessage}</p>
+        )}
+        {error && <p className="battlefield__error">{error.message}</p>}
+        <p className="battlefield__events">最近事件：{recentEvents}</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="battlefield__banner">
+      <strong>{guide?.title ?? "作战指引"}</strong>
+      {guide && <p className="battlefield__objective">{guide.objective}</p>}
+      <p className="battlefield__phase-info">当前阶段：{phaseLabel}</p>
+      {selectedAttacker ? (
+        <p>
+          当前选择：
+          <span className="battlefield__highlight">
+            {selectedAttacker.name}
+          </span>{" "}
+          · 选择攻击目标或点击英雄键。
+        </p>
+      ) : (
+        <p>从手牌中选择卡牌或点击己方随从发起攻击。</p>
+      )}
+      {interactionMessage && (
+        <p className="battlefield__info">{interactionMessage}</p>
+      )}
+      {error && <p className="battlefield__error">{error.message}</p>}
+      <p className="battlefield__events">最近事件：{recentEvents}</p>
+      <div className="battlefield__actions">
+        <button
+          type="button"
+          className="battlefield__action"
+          disabled={!canAttackHero}
+          onClick={onAttackHero}
+        >
+          攻击敌方英雄
+        </button>
+        <button
+          type="button"
+          className="battlefield__action"
+          disabled={!selectedAttacker}
+          onClick={onCancelSelection}
+        >
+          取消选择
+        </button>
+      </div>
     </div>
-  </div>
-);
+  );
+};
 
 interface HandZoneProps {
   cards: Card[];

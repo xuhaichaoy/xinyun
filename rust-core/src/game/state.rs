@@ -525,6 +525,7 @@ impl GameState {
     }
 
     pub fn draw_card(&mut self, player_id: PlayerId) -> Option<GameEvent> {
+        let max_hand_size = self.max_hand_size;
         let player = self.get_player_mut(player_id)?;
         if player.deck.is_empty() {
             if let Some(winner) = self.opponent_of(player_id) {
@@ -535,11 +536,8 @@ impl GameState {
 
         let card = player.deck.pop()?;
         let card_id = card.id;
-        if player.hand.len() as u8 >= self.max_hand_size {
-            let burned = GameEvent::CardBurned {
-                player_id,
-                card,
-            };
+        if player.hand.len() as u8 >= max_hand_size {
+            let burned = GameEvent::CardBurned { player_id, card };
             Some(burned)
         } else {
             player.hand.push(card);
@@ -564,8 +562,8 @@ impl GameState {
         for _ in 0..cards {
             for player_id in &player_ids {
                 if let Some(event) = self.draw_card(*player_id) {
-                    events.push(event);
                     self.record_event(event.clone());
+                    events.push(event);
                 }
             }
         }
@@ -610,7 +608,7 @@ impl GameState {
             self.current_player = next_player;
             self.turn += 1; // 增加回合数
             self.phase = GamePhase::Main; // 直接进入Main阶段
-            // 准备下一个玩家的回合（恢复法力、抽牌等）
+                                          // 准备下一个玩家的回合（恢复法力、抽牌等）
             self.ready_player(next_player);
         }
     }

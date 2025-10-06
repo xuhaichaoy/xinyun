@@ -28,4 +28,4 @@ pub use state::{
     VictoryReason,
     VictoryState,
 };
-pub use rules::{AttackAction, PlayCardAction, RuleEngine, RuleError, RuleResolution};
+pub use rules::{AttackAction, MulliganAction, PlayCardAction, RuleEngine, RuleError, RuleResolution};
