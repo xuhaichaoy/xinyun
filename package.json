@@ -1,0 +1,38 @@
+{
+  "name": "rust-wasm-react",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently -k -s first -n wasm,vite \"npm:wasm:dev\" \"vite\"",
+    "build": "npm run wasm:build && vite build",
+    "preview": "vite preview --host --port 4173",
+    "wasm:dev": "./scripts/dev-wasm.sh",
+    "wasm:build": "cd rust-core && wasm-pack build --release --target web --out-dir pkg",
+    "check:rust": "cd rust-core && cargo check --target wasm32-unknown-unknown",
+    "lint:rust": "cd rust-core && cargo fmt --all && cargo clippy --target wasm32-unknown-unknown -- -D warnings",
+    "test:rust": "cd rust-core && wasm-pack test --headless --chrome",
+    "lint": "biome check src/**/*",
+    "lint:fix": "biome check --apply src/**/*"
+  },
+  "dependencies": {
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-router-dom": "^6.30.1",
+    "uuid": "^9.0.1"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.1.1",
+    "@types/node": "^20.11.24",
+    "@types/react": "^18.2.37",
+    "@types/react-dom": "^18.2.15",
+    "@types/uuid": "^9.0.7",
+    "@vitejs/plugin-react": "^4.6.0",
+    "concurrently": "^9.1.0",
+    "typescript": "^5.4.0",
+    "vite": "^7.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

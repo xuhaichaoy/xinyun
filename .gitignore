@@ -1,0 +1,7 @@
+target
+pkg
+rust-core/pkg
+dist
+node_modules
+*.log
+.DS_Store
