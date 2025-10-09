@@ -177,6 +177,8 @@ pub struct Player {
     #[serde(default)]
     pub armor: u8,
     pub mana: u8,
+    #[serde(default)]
+    pub max_mana: u8,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hand: Vec<Card>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -200,9 +202,19 @@ impl Player {
             health,
             armor,
             mana,
+            max_mana: mana,
             hand,
             board,
             deck,
+        }
+    }
+
+    pub fn reconcile_mana_cap(&mut self) {
+        if self.max_mana == 0 {
+            self.max_mana = self.mana;
+        }
+        if self.mana > self.max_mana {
+            self.mana = self.max_mana;
         }
     }
 
@@ -224,6 +236,13 @@ impl Player {
             card.exhausted = false;
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PendingDiscard {
+    pub id: u64,
+    pub player_id: PlayerId,
+    pub drawn_card: Card,
 }
 
 /// 游戏阶段。
@@ -285,6 +304,15 @@ pub enum GameEvent {
         player_id: PlayerId,
         card: Card,
     },
+    DiscardPending {
+        player_id: PlayerId,
+        pending_id: u64,
+        card: Card,
+    },
+    CardDiscarded {
+        player_id: PlayerId,
+        card: Card,
+    },
     MulliganApplied {
         player_id: PlayerId,
         replaced: Vec<CardId>,
@@ -322,13 +350,24 @@ pub struct GameState {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mulligan_completed: Vec<PlayerId>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_discards: Vec<PendingDiscard>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub event_log: Vec<GameEvent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome: Option<VictoryState>,
+    #[serde(default)]
+    pub next_pending_discard_id: u64,
+    #[serde(default)]
+    pub version: u64,
 }
 
 impl GameState {
     pub fn new(players: Vec<Player>, current_player: PlayerId) -> Self {
+        let mut players = players;
+        for player in &mut players {
+            player.reconcile_mana_cap();
+        }
+
         Self {
             players,
             current_player,
@@ -337,8 +376,11 @@ impl GameState {
             max_hand_size: DEFAULT_MAX_HAND_SIZE,
             max_board_size: DEFAULT_MAX_BOARD_SIZE,
             mulligan_completed: Vec::new(),
+            pending_discards: Vec::new(),
             event_log: Vec::new(),
             outcome: None,
+            next_pending_discard_id: 0,
+            version: 1,
         }
     }
 
@@ -349,6 +391,19 @@ impl GameState {
 
     pub fn record_event(&mut self, event: GameEvent) {
         self.event_log.push(event);
+        self.version = self.version.saturating_add(1);
+    }
+
+    pub fn reconcile_after_load(&mut self) {
+        for player in &mut self.players {
+            player.reconcile_mana_cap();
+        }
+        if let Some(max_id) = self.pending_discards.iter().map(|pending| pending.id).max() {
+            self.next_pending_discard_id = max_id.saturating_add(1);
+        }
+        if self.version == 0 {
+            self.version = (self.event_log.len() as u64).saturating_add(1);
+        }
     }
 
     pub fn reset_for_mulligan(&mut self) {
@@ -535,14 +590,42 @@ impl GameState {
         }
 
         let card = player.deck.pop()?;
-        let card_id = card.id;
         if player.hand.len() as u8 >= max_hand_size {
-            let burned = GameEvent::CardBurned { player_id, card };
-            Some(burned)
+            let pending_id = self.next_pending_discard_id;
+            self.next_pending_discard_id = self.next_pending_discard_id.wrapping_add(1);
+            let pending = PendingDiscard {
+                id: pending_id,
+                player_id,
+                drawn_card: card,
+            };
+            let event = GameEvent::DiscardPending {
+                player_id,
+                pending_id,
+                card: pending.drawn_card.clone(),
+            };
+            self.pending_discards.push(pending);
+            Some(event)
         } else {
+            let card_id = card.id;
             player.hand.push(card);
             let event = GameEvent::CardDrawn { player_id, card_id };
             Some(event)
+        }
+    }
+
+    pub fn take_pending_discard(
+        &mut self,
+        player_id: PlayerId,
+        pending_id: u64,
+    ) -> Option<PendingDiscard> {
+        if let Some(pos) = self
+            .pending_discards
+            .iter()
+            .position(|pending| pending.id == pending_id && pending.player_id == player_id)
+        {
+            Some(self.pending_discards.remove(pos))
+        } else {
+            None
         }
     }
 
@@ -573,9 +656,11 @@ impl GameState {
     pub fn ready_player(&mut self, player_id: PlayerId) {
         if let Some(player) = self.get_player_mut(player_id) {
             player.ready_board();
+            player.reconcile_mana_cap();
 
-            // 恢复法力（每回合+1，最大10）
-            player.mana = (player.mana + 1).min(10);
+            // 恢复法力上限并填充（每回合+1，最大10）
+            player.max_mana = (player.max_mana + 1).min(10);
+            player.mana = player.max_mana;
 
             // 抽一张牌（只在牌库不为空时）
             if !player.deck.is_empty() {
@@ -611,8 +696,6 @@ impl GameState {
             self.current_player = next_player;
             self.turn += 1; // 增加回合数
             self.phase = GamePhase::Main; // 下一个玩家从Main阶段开始
-                                          // 准备下一个玩家的回合（恢复法力、抽牌等）
-            self.ready_player(next_player);
         }
     }
 
@@ -674,7 +757,13 @@ impl GameState {
                     value: player.health,
                 });
             }
-            if player.mana > 20 {
+            if player.max_mana > 10 {
+                return Err(IntegrityError::ManaOutOfRange {
+                    player_id: player.id,
+                    value: player.max_mana,
+                });
+            }
+            if player.mana > player.max_mana {
                 return Err(IntegrityError::ManaOutOfRange {
                     player_id: player.id,
                     value: player.mana,
@@ -918,8 +1007,11 @@ impl Default for GameState {
             max_hand_size: DEFAULT_MAX_HAND_SIZE,
             max_board_size: DEFAULT_MAX_BOARD_SIZE,
             mulligan_completed: Vec::new(),
+            pending_discards: Vec::new(),
             event_log: Vec::new(),
             outcome: None,
+            next_pending_discard_id: 0,
+            version: 0,
         }
     }
 }

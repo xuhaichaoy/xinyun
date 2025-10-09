@@ -6,6 +6,7 @@ import type {
   RuleResolution,
 } from "@/types/domain";
 import type { AiDecision, AiMoveResponse } from "@/types/domain";
+import type { GameStateError } from "@/hooks/useGameState";
 import { EventBus, type EventBusEntry, type EventMap } from "./EventBus";
 
 export type GameStateUpdateMode = "replace" | "incremental";
@@ -36,7 +37,7 @@ export interface GameEventMap extends EventMap {
   "state:eventsCleared": { total: number };
   "state:rollback": { state: GameState | null };
   "state:updateModeChanged": { mode: GameStateUpdateMode };
-  "state:error": { error: Error };
+  "state:error": { error: GameStateError };
   "ai:decision": { decision: AiDecision; playerId: number };
   "ai:applied": { response: AiMoveResponse; playerId: number };
   "canvas:invalidate": { reason: string; state: GameState | null };
@@ -44,7 +45,7 @@ export interface GameEventMap extends EventMap {
   "canvas:actionResult": {
     type: CanvasInteractionEvent["type"];
     success: boolean;
-    error?: Error;
+    error?: GameStateError;
   };
   "debug:log": {
     level: "debug" | "info" | "warn" | "error";
@@ -149,10 +150,12 @@ export const summarizeState = (state: GameState) => ({
   turn: state.turn,
   phase: state.phase,
   current: state.current_player,
+  version: state.version ?? 0,
   players: state.players.map((player) => ({
     id: player.id,
     health: player.health,
     mana: player.mana,
+    maxMana: player.max_mana,
     hand: player.hand?.length ?? 0,
     board: player.board?.length ?? 0,
   })),

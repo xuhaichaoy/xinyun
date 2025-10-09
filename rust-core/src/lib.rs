@@ -15,8 +15,8 @@ pub use ai::{AiAgent, AiConfig, AiDecision, AiDifficulty, AiStrategy, GameAction
 pub use game::{
     AttackAction, Card, CardEffect, CardId, CardType, EffectCondition, EffectContext, EffectEngine,
     EffectKind, EffectResolution, EffectStack, EffectTarget, EffectTrigger, GameEvent, GamePhase,
-    GameState, IntegrityError, MulliganAction, PlayCardAction, Player, PlayerId, RuleEngine, RuleError,
-    RuleResolution, VictoryReason, VictoryState,
+    GameState, IntegrityError, MulliganAction, PlayCardAction, Player, PlayerId, RuleEngine,
+    RuleError, RuleResolution, VictoryReason, VictoryState, DiscardCardAction,
 };
 
 #[cfg(feature = "wee_alloc")]
@@ -37,6 +37,27 @@ pub fn greet(name: &str) -> String {
 
 fn make_resolution(state: GameState, events: Vec<GameEvent>) -> RuleResolution {
     RuleResolution::new(state, events)
+}
+
+fn log_ai_reward(action: &GameAction, reward: f64, turn: u32) {
+    let description = match action {
+        GameAction::PlayCard { action } => format!("打出卡牌 #{}", action.card_id),
+        GameAction::Attack { action } => {
+            let target = action
+                .defender_card
+                .map(|id| format!("卡牌 #{}", id))
+                .unwrap_or_else(|| "英雄".to_string());
+            format!("攻击 ({} -> {})", action.attacker_id, target)
+        }
+        GameAction::Mulligan { .. } => "调度手牌".to_string(),
+        GameAction::AdvancePhase => "推进阶段".to_string(),
+        GameAction::EndTurn => "结束回合".to_string(),
+    };
+    let message = format!(
+        "[AI] 奖励 {:.2} ({}) 于回合 {}",
+        reward, description, turn
+    );
+    web_sys::console::log_1(&JsValue::from_str(&message));
 }
 
 fn to_js_error(error: RuleError) -> JsValue {
@@ -79,11 +100,15 @@ pub struct GameEngine {
 impl GameEngine {
     #[wasm_bindgen(constructor)]
     pub fn new(initial_state_json: Option<String>) -> Result<GameEngine, JsValue> {
-        let state = if let Some(json) = initial_state_json {
+        let mut state = if let Some(json) = initial_state_json {
             serde_json::from_str(&json).map_err(serde_to_js_error)?
         } else {
             GameState::sample()
         };
+        state.reconcile_after_load();
+        state
+            .integrity_check()
+            .map_err(|error| to_js_error(RuleError::IntegrityViolation { error }))?;
         Ok(GameEngine { state })
     }
 
@@ -92,7 +117,11 @@ impl GameEngine {
     }
 
     pub fn set_state_json(&mut self, json: &str) -> Result<(), JsValue> {
-        let state: GameState = serde_json::from_str(json).map_err(serde_to_js_error)?;
+        let mut state: GameState = serde_json::from_str(json).map_err(serde_to_js_error)?;
+        state.reconcile_after_load();
+        state
+            .integrity_check()
+            .map_err(|error| to_js_error(RuleError::IntegrityViolation { error }))?;
         self.state = state;
         Ok(())
     }
@@ -118,6 +147,15 @@ impl GameEngine {
         let action: AttackAction = serde_json::from_str(action_json).map_err(serde_to_js_error)?;
         let events = execute_with_engine(&mut self.state, |engine, state| {
             engine.attack(state, action.clone())
+        })?;
+        make_resolution_json(resolution_from_events(&self.state, events))
+    }
+
+    pub fn resolve_discard_json(&mut self, action_json: &str) -> Result<String, JsValue> {
+        let action: DiscardCardAction =
+            serde_json::from_str(action_json).map_err(serde_to_js_error)?;
+        let events = execute_with_engine(&mut self.state, |engine, state| {
+            engine.resolve_pending_discard(state, action.clone())
         })?;
         make_resolution_json(resolution_from_events(&self.state, events))
     }
@@ -163,13 +201,22 @@ impl GameEngine {
         let state_for_ai = self.state.clone();
         let mut agent = AiAgent::new(config);
         let decision = agent.decide_action(&state_for_ai, player_id);
-        
+        let chosen_action = decision.action.clone();
+
         // 然后应用决策
-        let applied = if let Some(action) = decision.action.clone() {
+        let applied = if let Some(action) = chosen_action.clone() {
             Some(self.apply_game_action(action)?)
         } else {
             None
         };
+
+        if let (Some(resolution), Some(action)) = (applied.as_ref(), chosen_action.as_ref()) {
+            let before_score = agent.evaluate_state(&state_for_ai, player_id);
+            let after_score = agent.evaluate_state(&self.state, player_id);
+            let reward = after_score - before_score;
+            agent.record_reward(action, reward);
+            log_ai_reward(action, reward, resolution.state.turn);
+        }
 
         let response = AiMoveResponse { decision, applied };
         serde_json::to_string(&response).map_err(serde_to_js_error)
@@ -223,6 +270,10 @@ impl GameEngine {
                     engine.attack(state, action.clone())
                 })?;
                 Ok(resolution_from_events(&self.state, events))
+            }
+            GameAction::AdvancePhase => {
+                RuleEngine::advance_phase(&mut self.state).map_err(to_js_error)?;
+                Ok(resolution_from_events(&self.state, Vec::new()))
             }
             GameAction::EndTurn => {
                 let mut engine = RuleEngine::new();
@@ -293,6 +344,17 @@ pub fn attack(state: JsValue, action: JsValue) -> Result<JsValue, JsValue> {
     let action: AttackAction = from_value(action).map_err(JsValue::from)?;
     let mut engine = RuleEngine::new();
     match engine.attack(&mut state, action) {
+        Ok(events) => to_value(&make_resolution(state, events)).map_err(JsValue::from),
+        Err(error) => Err(to_js_error(error)),
+    }
+}
+
+#[wasm_bindgen(js_name = "resolvePendingDiscard")]
+pub fn resolve_pending_discard(state: JsValue, action: JsValue) -> Result<JsValue, JsValue> {
+    let mut state: GameState = from_value(state).map_err(JsValue::from)?;
+    let action: DiscardCardAction = from_value(action).map_err(JsValue::from)?;
+    let mut engine = RuleEngine::new();
+    match engine.resolve_pending_discard(&mut state, action) {
         Ok(events) => to_value(&make_resolution(state, events)).map_err(JsValue::from),
         Err(error) => Err(to_js_error(error)),
     }

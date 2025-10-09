@@ -46,6 +46,10 @@ function renderEvent(event: GameEvent): string {
       return `玩家 #${event.player_id} 的卡牌 #${event.card.id} 被摧毁`;
     case "CardBurned":
       return `玩家 #${event.player_id} 的卡牌 ${event.card.name} 因手牌溢出被焚毁`;
+    case "DiscardPending":
+      return `玩家 #${event.player_id} 抽到了 ${event.card.name}，等待选择弃置`;
+    case "CardDiscarded":
+      return `玩家 #${event.player_id} 弃置了卡牌 ${event.card.name}`;
     case "MulliganApplied": {
       if (event.replaced.length === 0) {
         return `玩家 #${event.player_id} 保留了全部起手牌`;

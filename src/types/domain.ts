@@ -105,9 +105,16 @@ export interface Player {
   health: number;
   armor: number;
   mana: number;
+  max_mana: number;
   hand?: Card[];
   board?: Card[];
   deck?: Card[];
+}
+
+export interface PendingDiscard {
+  id: number;
+  player_id: PlayerId;
+  drawn_card: Card;
 }
 
 export type GamePhase = "Mulligan" | "Main" | "Combat" | "End";
@@ -143,6 +150,13 @@ export type GameEvent =
     }
   | { type: "CardDestroyed"; player_id: PlayerId; card: Card }
   | { type: "CardBurned"; player_id: PlayerId; card: Card }
+  | {
+      type: "DiscardPending";
+      player_id: PlayerId;
+      pending_id: number;
+      card: Card;
+    }
+  | { type: "CardDiscarded"; player_id: PlayerId; card: Card }
   | { type: "MulliganApplied"; player_id: PlayerId; replaced: CardId[] }
   | { type: "TurnEnded"; player_id: PlayerId }
   | { type: "GameWon"; winner: PlayerId; reason: VictoryReason };
@@ -155,8 +169,11 @@ export interface GameState {
   max_hand_size?: number;
   max_board_size?: number;
   mulligan_completed?: PlayerId[];
+  pending_discards?: PendingDiscard[];
   event_log?: GameEvent[];
   outcome?: VictoryState;
+  version?: number;
+  next_pending_discard_id?: number;
 }
 
 export interface RuleResolution {
@@ -183,15 +200,18 @@ export type RuleError =
   | { type: "UnitExhausted"; card_id: CardId }
   | { type: "InvalidAttackTarget" }
   | { type: "AttackerNotFound"; card_id: CardId }
+  | { type: "ZeroAttackUnit"; card_id: CardId }
   | { type: "BoardFull" }
   | { type: "MulliganPhaseOnly" }
   | { type: "MulliganAlreadyCompleted"; player_id: PlayerId }
+  | { type: "PendingDiscardNotFound"; player_id: PlayerId; pending_id: number }
   | { type: "IntegrityViolation"; error: IntegrityError };
 
 export type GameAction =
   | { type: "PlayCard"; action: PlayCardAction }
   | { type: "Mulligan"; action: MulliganAction }
   | { type: "Attack"; action: AttackAction }
+  | { type: "AdvancePhase" }
   | { type: "EndTurn" };
 
 export type AiDifficulty = "easy" | "normal" | "hard" | "expert";

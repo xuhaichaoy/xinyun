@@ -4,6 +4,7 @@ import type {
   AiMoveResponse,
   AiStrategy,
   AttackAction,
+  DiscardCardAction,
   GameState,
   MulliganAction,
   PlayCardAction,
@@ -25,6 +26,7 @@ export interface GameEngineServiceOptions {
   logger?: Pick<Console, "error" | "warn" | "info" | "debug">;
   eventBus?: GameEventBus;
   retainModuleInstance?: boolean;
+  aiDelays?: Partial<Record<AiDifficulty, number>>;
 }
 
 export interface ApplyAiOptions {
@@ -76,6 +78,7 @@ export class GameEngineService {
     Partial<Omit<GameEngineServiceOptions, "maxRetries" | "retryDelay">>;
   private disposed = false;
   private readonly eventBus?: GameEventBus;
+  private readonly aiDelays: Record<AiDifficulty, number>;
 
   private constructor(module: WasmModule, engine: WasmGameEngine, options: GameEngineServiceOptions) {
     const {
@@ -89,6 +92,16 @@ export class GameEngineService {
     this.module = module;
     this.engine = engine;
     this.options = { maxRetries, retryDelay, logger, debugKey, ...rest };
+    const defaultDelays: Record<AiDifficulty, number> = {
+      easy: 0,
+      normal: 200,
+      hard: 500,
+      expert: 800,
+    };
+    this.aiDelays = {
+      ...defaultDelays,
+      ...(options.aiDelays ?? {}),
+    } as Record<AiDifficulty, number>;
     this.eventBus = options.eventBus;
     this.attachDevtools();
     this.emitStateInitialized();
@@ -182,6 +195,13 @@ export class GameEngineService {
     }, "attack", { action });
   }
 
+  public async resolvePendingDiscard(action: DiscardCardAction): Promise<RuleResolution> {
+    return this.withRetry(() => {
+      const json = this.engine.resolve_discard_json(JSON.stringify(action));
+      return parseJson<RuleResolution>(json, "resolve_pending_discard");
+    }, "resolve_pending_discard", { action });
+  }
+
   public async startTurn(playerId: number): Promise<RuleResolution> {
     return this.withRetry(() => {
       const json = this.engine.start_turn(playerId);
@@ -213,15 +233,12 @@ export class GameEngineService {
   }
 
   public async thinkAi(playerId: number, options: ThinkAiOptions = {}): Promise<AiDecision> {
+    const difficulty = options.difficulty ?? "normal";
+    const delay = options.delayMs ?? this.aiDelays[difficulty];
     const decision = await this.withRetry(async () => {
-      const json = await this.engine.think_ai(
-        playerId,
-        options.difficulty,
-        options.strategy,
-        options.delayMs
-      );
+      const json = await this.engine.think_ai(playerId, difficulty, options.strategy, delay);
       return parseJson<AiDecision>(json, "think_ai");
-    }, "think_ai_async", { playerId, options });
+    }, "think_ai_async", { playerId, difficulty, delay });
     this.eventBus?.emit("ai:decision", { decision, playerId });
     return decision;
   }

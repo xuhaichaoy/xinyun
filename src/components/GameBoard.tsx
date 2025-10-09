@@ -1,7 +1,7 @@
 import { memo, useCallback, useEffect, useMemo, useState, useRef } from "react";
-import type { CSSProperties } from "react";
+import type { CSSProperties, KeyboardEvent as ReactKeyboardEvent } from "react";
 
-import type { Card, GameEvent, GamePhase } from "@/types/domain";
+import type { Card, GameEvent, GamePhase, PendingDiscard } from "@/types/domain";
 import type { UseGameStateResult } from "@/hooks/useGameState";
 
 import { ActionPanel } from "./ActionPanel";
@@ -38,11 +38,14 @@ export const GameBoard = ({ gameStateHook, scenarioGuide }: GameBoardProps) => {
     isMutating,
     error,
     clearEvents,
+    clearHistory,
     reload,
     playCard,
     mulligan,
     attack,
+    resolveDiscard,
     advancePhase,
+    formatError,
   } = gameStateHook;
 
   const [player, opponent] = useMemo(() => {
@@ -97,15 +100,15 @@ export const GameBoard = ({ gameStateHook, scenarioGuide }: GameBoardProps) => {
           const resolution = await advancePhase();
           currentPhase = resolution.state.phase;
         } catch (err) {
-          // 如果游戏结束，停止推进阶段
-          if (err instanceof Error && err.message.includes("GameFinished")) {
+          const formatted = formatError(err);
+          if (formatted.code === "GameFinished") {
             return;
           }
-          throw err;
+          throw formatted.raw;
         }
       }
     },
-    [advancePhase, state]
+    [advancePhase, formatError, state]
   );
 
   const [showSettings, setShowSettings] = useState(false);
@@ -119,6 +122,10 @@ export const GameBoard = ({ gameStateHook, scenarioGuide }: GameBoardProps) => {
   const [pendingTarget, setPendingTarget] = useState<PendingTarget | null>(
     null
   );
+  const [activeDiscard, setActiveDiscard] = useState<PendingDiscard | null>(
+    null
+  );
+  const [resolvingDiscard, setResolvingDiscard] = useState(false);
 
   const toggleSettings = useCallback(
     () => setShowSettings((prev) => !prev),
@@ -173,13 +180,15 @@ export const GameBoard = ({ gameStateHook, scenarioGuide }: GameBoardProps) => {
       await endTurn(); // endTurn现在会直接处理回合转换
       setInteractionMessage("等待对手行动…");
     } catch (err) {
-      setInteractionMessage(err instanceof Error ? err.message : String(err));
+      const formatted = formatError(err);
+      setInteractionMessage(formatted.message);
     }
   }, [
     ensurePhase,
     endTurn,
     isMulliganPhase,
     player,
+    formatError,
     playerHasCompletedMulligan,
     opponent,
     state,
@@ -190,6 +199,26 @@ export const GameBoard = ({ gameStateHook, scenarioGuide }: GameBoardProps) => {
       resetSelections();
     }
   }, [isPlayerTurn, resetSelections]);
+
+  useEffect(() => {
+    if (!state || !player) {
+      setActiveDiscard(null);
+      return;
+    }
+    const pendingList = state.pending_discards ?? [];
+    const nextPending = pendingList.find(
+      (entry) => entry.player_id === player.id
+    );
+    setActiveDiscard((current) => {
+      if (!nextPending) {
+        return null;
+      }
+      if (!current || current.id !== nextPending.id) {
+        setInteractionMessage("手牌已满，请选择弃置的卡牌");
+      }
+      return current && current.id === nextPending.id ? current : nextPending;
+    });
+  }, [player, state]);
 
   // 移除复杂的回合管理effect，现在由endTurn直接处理
 
@@ -330,22 +359,8 @@ export const GameBoard = ({ gameStateHook, scenarioGuide }: GameBoardProps) => {
           );
           setInteractionMessage(`已出牌：${card.name}`);
         } catch (err) {
-          let message = err instanceof Error ? err.message : String(err);
-
-          // 处理特定的游戏规则错误
-          if (message.includes("InsufficientMana")) {
-            message = `法力不足，需要 ${card.cost} 点法力`;
-          } else if (message.includes("InvalidPhase")) {
-            message = "当前阶段不允许出牌";
-          } else if (message.includes("NotPlayerTurn")) {
-            message = "现在不是你的回合";
-          } else if (message.includes("BoardFull")) {
-            message = "战场已满，无法召唤更多随从";
-          } else if (message.includes("CardNotFound")) {
-            message = "卡牌不存在或已被移除";
-          }
-
-          setInteractionMessage(message);
+          const formatted = formatError(err);
+          setInteractionMessage(formatted.message);
         }
       };
 
@@ -362,6 +377,7 @@ export const GameBoard = ({ gameStateHook, scenarioGuide }: GameBoardProps) => {
       opponent,
       player,
       resetSelections,
+      formatError,
     ]
   );
 
@@ -387,17 +403,18 @@ export const GameBoard = ({ gameStateHook, scenarioGuide }: GameBoardProps) => {
           setInteractionMessage("保留全部手牌");
         }
       } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        let display = message;
-        if (message.includes("MulliganAlreadyCompleted")) {
-          display = "本方调度已完成";
-        } else if (message.includes("MulliganPhaseOnly")) {
-          display = "该操作仅允许在调度阶段执行";
-        }
-        setInteractionMessage(display);
+        const formatted = formatError(err);
+        setInteractionMessage(formatted.message);
       }
     },
-    [isMulliganPhase, isMutating, mulligan, player, playerHasCompletedMulligan]
+    [
+      formatError,
+      isMulliganPhase,
+      isMutating,
+      mulligan,
+      player,
+      playerHasCompletedMulligan,
+    ]
   );
 
   const handleConfirmMulligan = useCallback(() => {
@@ -459,6 +476,12 @@ export const GameBoard = ({ gameStateHook, scenarioGuide }: GameBoardProps) => {
         return;
       }
 
+      if (selectedAttacker.attack <= 0) {
+        setInteractionMessage("该单位无法攻击");
+        resetSelections();
+        return;
+      }
+
       const executeAttack = async () => {
         if (selectedAttacker.exhausted) {
           setInteractionMessage(`${selectedAttacker.name} 已经攻击过了`);
@@ -480,19 +503,14 @@ export const GameBoard = ({ gameStateHook, scenarioGuide }: GameBoardProps) => {
           );
           resetSelections();
         } catch (err) {
-          let message = err instanceof Error ? err.message : String(err);
-
-          // 处理特定的游戏规则错误
-          if (message.includes("UnitExhausted")) {
-            message = `${selectedAttacker.name} 已经攻击过了，无法再次攻击`;
+          const formatted = formatError(err);
+          if (
+            formatted.code === "UnitExhausted" ||
+            formatted.code === "ZeroAttackUnit"
+          ) {
             resetSelections();
-          } else if (message.includes("InvalidPhase")) {
-            message = "当前阶段不允许攻击";
-          } else if (message.includes("NotPlayerTurn")) {
-            message = "现在不是你的回合";
           }
-
-          setInteractionMessage(message);
+          setInteractionMessage(formatted.message);
         }
       };
 
@@ -507,8 +525,44 @@ export const GameBoard = ({ gameStateHook, scenarioGuide }: GameBoardProps) => {
       opponent,
       player,
       resetSelections,
+      formatError,
       selectedAttacker,
     ]
+  );
+
+  const handleResolveDiscard = useCallback(
+    (cardId: number) => {
+      if (!player || !activeDiscard) {
+        return;
+      }
+      const discardName =
+        cardId === activeDiscard.drawn_card.id
+          ? activeDiscard.drawn_card.name
+          : player.hand?.find((card) => card.id === cardId)?.name;
+
+      setResolvingDiscard(true);
+      resolveDiscard({
+        player_id: player.id,
+        pending_id: activeDiscard.id,
+        discard_card_id: cardId,
+      })
+        .then(() => {
+          if (discardName) {
+            setInteractionMessage(`已弃置 ${discardName}`);
+          } else {
+            setInteractionMessage(`已弃置卡牌 #${cardId}`);
+          }
+          setActiveDiscard(null);
+        })
+        .catch((err) => {
+          const formatted = formatError(err);
+          setInteractionMessage(formatted.message);
+        })
+        .finally(() => {
+          setResolvingDiscard(false);
+        });
+    },
+    [activeDiscard, formatError, player, resolveDiscard]
   );
 
   useEffect(() => {
@@ -536,10 +590,11 @@ export const GameBoard = ({ gameStateHook, scenarioGuide }: GameBoardProps) => {
   const playerBoard = player.board ?? [];
   const opponentBoard = opponent.board ?? [];
   const playerHand = player.hand ?? [];
-  const canInteract = !isMulliganPhase || playerHasCompletedMulligan;
+  const canInteract =
+    (!isMulliganPhase || playerHasCompletedMulligan) && !activeDiscard;
 
   return (
-    <div className="game-app">
+    <div className="game-app" aria-busy={isMutating}>
       <section className="game-board" role="application" aria-label="卡牌对战">
         <div className="battle-layout">
           <aside className="battle-layout__sidebar battle-layout__sidebar--left">
@@ -602,7 +657,8 @@ export const GameBoard = ({ gameStateHook, scenarioGuide }: GameBoardProps) => {
               <ActionPanel
                 onEndTurn={handleEndTurn}
                 onSettings={toggleSettings}
-                disabled={isMutating || !canInteract}
+                disabled={!canInteract}
+                loading={isMutating}
               />
             </div>
             <div className="sidebar-panel">
@@ -619,6 +675,8 @@ export const GameBoard = ({ gameStateHook, scenarioGuide }: GameBoardProps) => {
           setUpdateMode={setUpdateMode}
           clearEvents={clearEvents}
           reload={reload}
+          loading={isMutating}
+          clearHistory={clearHistory}
         />
       )}
       {pendingTarget && (
@@ -646,25 +704,19 @@ export const GameBoard = ({ gameStateHook, scenarioGuide }: GameBoardProps) => {
                 setPendingTarget(null);
               })
               .catch((err) => {
-                let message = err instanceof Error ? err.message : String(err);
-
-                // 处理特定的游戏规则错误
-                if (message.includes("InsufficientMana")) {
-                  message = `法力不足，需要 ${pendingTarget.card.cost} 点法力`;
-                } else if (message.includes("InvalidPhase")) {
-                  message = "当前阶段不允许出牌";
-                } else if (message.includes("NotPlayerTurn")) {
-                  message = "现在不是你的回合";
-                } else if (message.includes("CardNotFound")) {
-                  message = "卡牌不存在或已被移除";
-                } else if (message.includes("InvalidTarget")) {
-                  message = "无效的目标选择";
-                }
-
-                setInteractionMessage(message);
+                const formatted = formatError(err);
+                setInteractionMessage(formatted.message);
                 setPendingTarget(null);
               });
           }}
+        />
+      )}
+      {activeDiscard && player && (
+        <DiscardOverlay
+          drawnCard={activeDiscard.drawn_card}
+          hand={playerHand}
+          resolving={resolvingDiscard || isMutating}
+          onDiscard={handleResolveDiscard}
         />
       )}
       {isMulliganPhase && !playerHasCompletedMulligan && (
@@ -709,13 +761,51 @@ interface TargetOverlayProps {
 
 const TargetOverlay = ({ request, onSelect, onClose }: TargetOverlayProps) => {
   const definition = getCardDefinition(request.card.id);
+  const [focusedIndex, setFocusedIndex] = useState(0);
+  const buttonRefs = useRef<Array<HTMLButtonElement | null>>([]);
+
+  useEffect(() => {
+    buttonRefs.current = buttonRefs.current.slice(0, request.options.length);
+    setFocusedIndex(0);
+  }, [request.options.length]);
+
+  useEffect(() => {
+    buttonRefs.current[focusedIndex]?.focus();
+  }, [focusedIndex, request.options.length]);
+
+  const handleKeyDown = useCallback(
+    (event: ReactKeyboardEvent<HTMLDivElement>) => {
+      if (request.options.length === 0) {
+        return;
+      }
+      if (event.key === "ArrowRight" || event.key === "ArrowDown") {
+        event.preventDefault();
+        setFocusedIndex((prev) => (prev + 1) % request.options.length);
+      } else if (event.key === "ArrowLeft" || event.key === "ArrowUp") {
+        event.preventDefault();
+        setFocusedIndex((prev) =>
+          (prev - 1 + request.options.length) % request.options.length
+        );
+      }
+    },
+    [request.options.length]
+  );
+
   return (
-    <div className="target-overlay" role="dialog" aria-modal="true">
+    <div
+      className="target-overlay"
+      role="dialog"
+      aria-modal="true"
+      onKeyDown={handleKeyDown}
+    >
       <div className="target-overlay__panel">
         <header>
           <h3>选择目标</h3>
           <p>{request.card.name}</p>
           {definition?.ability && <small>{definition.ability}</small>}
+          {!definition?.target && request.targetSide !== "none" && (
+            <small>该卡未指定目标，已应用默认选择规则</small>
+          )}
         </header>
         <div className="target-overlay__options">
           {request.options.map((option, index) => (
@@ -724,6 +814,9 @@ const TargetOverlay = ({ request, onSelect, onClose }: TargetOverlayProps) => {
               type="button"
               className="target-overlay__option"
               onClick={() => onSelect(option)}
+              ref={(element) => {
+                buttonRefs.current[index] = element;
+              }}
             >
               {option.label}
             </button>
@@ -742,6 +835,48 @@ const TargetOverlay = ({ request, onSelect, onClose }: TargetOverlayProps) => {
     </div>
   );
 };
+
+interface DiscardOverlayProps {
+  drawnCard: Card;
+  hand: Card[];
+  resolving: boolean;
+  onDiscard: (cardId: number) => void;
+}
+
+const DiscardOverlay = ({ drawnCard, hand, resolving, onDiscard }: DiscardOverlayProps) => (
+  <div className="target-overlay" role="dialog" aria-modal="true">
+    <div className="target-overlay__panel">
+      <header>
+        <h3>手牌已满</h3>
+        <p>请选择要弃置的卡牌以继续游戏</p>
+      </header>
+      <div className="target-overlay__options">
+        <button
+          type="button"
+          className="target-overlay__option"
+          onClick={() => onDiscard(drawnCard.id)}
+          disabled={resolving}
+        >
+          弃置新抽到的 {drawnCard.name}
+        </button>
+      </div>
+      <h4>或弃置手牌：</h4>
+      <div className="target-overlay__options">
+        {hand.map((card) => (
+          <button
+            key={card.id}
+            type="button"
+            className="target-overlay__option"
+            onClick={() => onDiscard(card.id)}
+            disabled={resolving}
+          >
+            弃置 {card.name}
+          </button>
+        ))}
+      </div>
+    </div>
+  </div>
+);
 
 interface MulliganOverlayProps {
   cards: Card[];
@@ -841,7 +976,7 @@ interface StageProps {
   playerBoard: Card[];
   opponentBoard: Card[];
   interactionMessage: string | null;
-  error: Error | null;
+  error: UseGameStateResult["error"];
   events: GameEvent[];
   isMutating: boolean;
   phase: GamePhase;
@@ -1010,7 +1145,7 @@ const HeroBadge = ({
       <div>
         <span>❤ {player.health}</span>
         <span>🛡 {player.armor}</span>
-        <span>🔷 {player.mana}</span>
+        <span>🔷 {player.mana}/{player.max_mana ?? player.mana}</span>
         <span>🃏 {player.deck?.length ?? 0}</span>
       </div>
     </div>
@@ -1136,6 +1271,8 @@ interface SettingsOverlayProps {
   setUpdateMode: (mode: "replace" | "incremental") => void;
   clearEvents: () => void;
   reload: () => Promise<void>;
+  loading?: boolean;
+  clearHistory: () => void;
 }
 
 const SettingsOverlay = ({
@@ -1144,6 +1281,8 @@ const SettingsOverlay = ({
   setUpdateMode,
   clearEvents,
   reload,
+  loading,
+  clearHistory,
 }: SettingsOverlayProps) => (
   <div
     style={{
@@ -1157,6 +1296,7 @@ const SettingsOverlay = ({
     role="dialog"
     aria-modal="true"
     aria-label="高级设置"
+    aria-busy={loading}
   >
     <div
       style={{
@@ -1201,6 +1341,7 @@ const SettingsOverlay = ({
           type="button"
           className="action-panel__button action-panel__button--primary"
           onClick={onClose}
+          disabled={loading}
         >
           关闭
         </button>
@@ -1212,8 +1353,20 @@ const SettingsOverlay = ({
             void reload();
             onClose();
           }}
+          disabled={loading}
         >
-          清空事件并刷新
+          {loading ? "处理中…" : "清空事件并刷新"}
+        </button>
+        <button
+          type="button"
+          className="action-panel__button"
+          onClick={() => {
+            clearHistory();
+            onClose();
+          }}
+          disabled={loading}
+        >
+          清理历史缓存
         </button>
       </div>
     </div>

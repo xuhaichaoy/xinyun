@@ -4,6 +4,7 @@ import type {
   AiStrategy,
   AttackAction,
   Card,
+  DiscardCardAction,
   EffectContext,
   GameState,
   MulliganAction,
@@ -17,6 +18,9 @@ type WasmModule = typeof import("../../rust-core/pkg/wasm_game.js");
 const GLOBAL_CACHE_KEY = "__WASM_GAME_MODULE_CACHE__";
 
 let wasmModulePromise: Promise<WasmModule> | null = null;
+let wasmResponsePromise: Promise<Response> | null = null;
+const aiDecisionCache = new Map<string, AiDecision>();
+const MAX_AI_CACHE = 24;
 
 const getGlobalCache = (): Promise<WasmModule> | null => {
   if (typeof globalThis === "undefined") return null;
@@ -32,6 +36,19 @@ const setGlobalCache = (promise: Promise<WasmModule> | null) => {
   }
 };
 
+const fetchWasmResponse = async () => {
+  const url = new URL("../../rust-core/pkg/wasm_game_bg.wasm", import.meta.url);
+  return fetch(url);
+};
+
+const getWasmResponse = async (): Promise<Response> => {
+  if (!wasmResponsePromise) {
+    wasmResponsePromise = fetchWasmResponse();
+  }
+  const response = await wasmResponsePromise;
+  return response.clone();
+};
+
 export async function initGameCore() {
   if (!wasmModulePromise) {
     wasmModulePromise = getGlobalCache();
@@ -39,7 +56,13 @@ export async function initGameCore() {
 
   if (!wasmModulePromise) {
     wasmModulePromise = import("../../rust-core/pkg/wasm_game.js").then(async (module) => {
-      await module.default();
+      try {
+        const response = await getWasmResponse();
+        await module.default(response);
+      } catch (error) {
+        console.warn("[wasm] streaming init failed, falling back", error);
+        await module.default();
+      }
       return module;
     });
     setGlobalCache(wasmModulePromise);
@@ -65,6 +88,7 @@ export function prefetchGameCore() {
 
 export function clearWasmCache() {
   wasmModulePromise = null;
+  wasmResponsePromise = null;
   setGlobalCache(null);
 }
 
@@ -111,6 +135,14 @@ export async function attack(
   return wasm.attack(state, action);
 }
 
+export async function resolvePendingDiscard(
+  state: GameState,
+  action: DiscardCardAction
+): Promise<RuleResolution> {
+  const wasm = await initGameCore();
+  return wasm.resolvePendingDiscard(state, action);
+}
+
 export async function startTurn(state: GameState, playerId: number): Promise<RuleResolution> {
   const wasm = await initGameCore();
   return wasm.startTurn(state, playerId);
@@ -142,6 +174,45 @@ export async function computeAiMove(
   difficulty: AiDifficulty = "normal",
   strategy?: AiStrategy
 ): Promise<AiDecision> {
+  const cacheKey = createAiCacheKey(state, playerId, difficulty, strategy);
+  if (aiDecisionCache.has(cacheKey)) {
+    const cached = aiDecisionCache.get(cacheKey)!;
+    if (typeof globalThis.structuredClone === "function") {
+      return globalThis.structuredClone(cached);
+    }
+    return JSON.parse(JSON.stringify(cached));
+  }
   const wasm = await initGameCore();
-  return wasm.computeAiMove(state, playerId, difficulty, strategy);
+  const decision = await wasm.computeAiMove(state, playerId, difficulty, strategy);
+  aiDecisionCache.set(cacheKey, decision);
+  if (aiDecisionCache.size > MAX_AI_CACHE) {
+    const firstKey = aiDecisionCache.keys().next().value;
+    if (firstKey) {
+      aiDecisionCache.delete(firstKey);
+    }
+  }
+  return decision;
 }
+
+const createAiCacheKey = (
+  state: GameState,
+  playerId: number,
+  difficulty: AiDifficulty,
+  strategy?: AiStrategy
+) => {
+  const summary = {
+    turn: state.turn,
+    current: state.current_player,
+    phase: state.phase,
+    players: state.players.map((player) => ({
+      id: player.id,
+      health: player.health,
+      armor: player.armor,
+      mana: player.mana,
+      maxMana: player.max_mana,
+      hand: player.hand?.map((card) => card.id) ?? [],
+      board: player.board?.map((card) => ({ id: card.id, health: card.health, attack: card.attack })) ?? [],
+    })),
+  };
+  return `${playerId}:${difficulty}:${strategy ?? "auto"}:${JSON.stringify(summary)}`;
+};

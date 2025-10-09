@@ -416,6 +416,7 @@ dependencies = [
  "console_error_panic_hook",
  "getrandom",
  "gloo-timers",
+ "once_cell",
  "rand",
  "serde",
  "serde-wasm-bindgen",

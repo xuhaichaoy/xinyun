@@ -8,9 +8,13 @@ use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 
 use crate::game::{
-    AttackAction, Card, CardId, CardType, GameEvent, GameState, MulliganAction, PlayCardAction,
-    PlayerId, RuleEngine, RuleError, RuleResolution,
+    AttackAction, Card, CardId, CardType, GameEvent, GamePhase, GameState, MulliganAction,
+    PlayCardAction, PlayerId, RuleEngine, RuleError, RuleResolution,
 };
+
+use self::learning::bias as learning_bias;
+
+const LEARNING_IMPORTANCE: f64 = 0.45;
 
 #[derive(Debug, Clone, Copy)]
 struct WasmInstant {
@@ -58,6 +62,7 @@ pub enum GameAction {
     PlayCard { action: PlayCardAction },
     Mulligan { action: MulliganAction },
     Attack { action: AttackAction },
+    AdvancePhase,
     EndTurn,
 }
 
@@ -109,12 +114,21 @@ impl FromStr for AiDifficulty {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct DifficultyWeights {
+    pub hero: f64,
+    pub board: f64,
+    pub resources: f64,
+    pub combo: f64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AiConfig {
     pub depth: u8,
     pub randomness: f64,
     pub time_limit: Duration,
     pub strategy: AiStrategy,
+    pub weights: DifficultyWeights,
 }
 
 impl AiConfig {
@@ -125,24 +139,48 @@ impl AiConfig {
                 randomness: 1.2,
                 time_limit: Duration::from_millis(40),
                 strategy: AiStrategy::Random,
+                weights: DifficultyWeights {
+                    hero: 0.8,
+                    board: 0.9,
+                    resources: 1.1,
+                    combo: 0.9,
+                },
             },
             AiDifficulty::Normal => Self {
                 depth: 2,
                 randomness: 0.6,
                 time_limit: Duration::from_millis(90),
                 strategy: AiStrategy::Control,
+                weights: DifficultyWeights {
+                    hero: 1.0,
+                    board: 1.0,
+                    resources: 1.0,
+                    combo: 1.0,
+                },
             },
             AiDifficulty::Hard => Self {
                 depth: 3,
                 randomness: 0.2,
                 time_limit: Duration::from_millis(160),
                 strategy: AiStrategy::Aggressive,
+                weights: DifficultyWeights {
+                    hero: 1.15,
+                    board: 1.2,
+                    resources: 0.95,
+                    combo: 1.1,
+                },
             },
             AiDifficulty::Expert => Self {
                 depth: 4,
                 randomness: 0.0,
                 time_limit: Duration::from_millis(260),
                 strategy: AiStrategy::Adaptive,
+                weights: DifficultyWeights {
+                    hero: 1.25,
+                    board: 1.3,
+                    resources: 1.05,
+                    combo: 1.2,
+                },
             },
         }
     }
@@ -203,6 +241,14 @@ impl AiAgent {
             config,
             rng: SmallRng::from_entropy(),
         }
+    }
+
+    pub fn record_reward(&self, action: &GameAction, reward: f64) {
+        learning::record(action, reward);
+    }
+
+    pub fn evaluate_state(&self, state: &GameState, player_id: PlayerId) -> f64 {
+        self.evaluate(state, player_id)
     }
 
     pub fn with_seed(config: AiConfig, seed: u64) -> Self {
@@ -458,6 +504,16 @@ impl AiAgent {
             return actions;
         }
 
+        if state.phase == GamePhase::Main {
+            let advance = GameAction::AdvancePhase;
+            if !seen.contains(&advance) {
+                if let Ok(new_state) = self.simulate_state(state, &advance) {
+                    seen.push(advance.clone());
+                    actions.push((advance, new_state));
+                }
+            }
+        }
+
         if let Some(player) = state.get_player(actor) {
             // Playable cards
             for card in &player.hand {
@@ -478,6 +534,22 @@ impl AiAgent {
                     target_card: None,
                 });
 
+                // 友方目标（英雄与随从）
+                candidates.push(PlayCardAction {
+                    player_id: actor,
+                    card_id: card.id,
+                    target_player: Some(actor),
+                    target_card: None,
+                });
+                for ally in &player.board {
+                    candidates.push(PlayCardAction {
+                        player_id: actor,
+                        card_id: card.id,
+                        target_player: Some(actor),
+                        target_card: Some(ally.id),
+                    });
+                }
+
                 if let Some(opponent) = state.opponent_of(actor) {
                     candidates.push(PlayCardAction {
                         player_id: actor,
@@ -487,7 +559,7 @@ impl AiAgent {
                     });
 
                     if let Some(opponent_player) = state.get_player(opponent) {
-                        for target in opponent_player.board.iter().take(4) {
+                        for target in &opponent_player.board {
                             candidates.push(PlayCardAction {
                                 player_id: actor,
                                 card_id: card.id,
@@ -515,50 +587,52 @@ impl AiAgent {
             }
 
             // Attacks
-            if let Some(opponent) = state.opponent_of(actor) {
-                let defender_board: Vec<CardId> = state
-                    .get_player(opponent)
-                    .map(|p| p.board.iter().map(|c| c.id).collect())
-                    .unwrap_or_default();
+            if state.phase == GamePhase::Combat {
+                if let Some(opponent) = state.opponent_of(actor) {
+                    let defender_board: Vec<CardId> = state
+                        .get_player(opponent)
+                        .map(|p| p.board.iter().map(|c| c.id).collect())
+                        .unwrap_or_default();
 
-                for card in &player.board {
-                    if let Some(deadline) = deadline {
-                        if WasmInstant::now() >= deadline {
-                            break;
+                    for card in &player.board {
+                        if let Some(deadline) = deadline {
+                            if WasmInstant::now() >= deadline {
+                                break;
+                            }
                         }
-                    }
-                    if card.exhausted || card.attack <= 0 {
-                        continue;
-                    }
+                        if card.exhausted || card.attack <= 0 {
+                            continue;
+                        }
 
-                    let mut candidates: Vec<AttackAction> = Vec::new();
-                    candidates.push(AttackAction {
-                        attacker_owner: actor,
-                        attacker_id: card.id,
-                        defender_owner: opponent,
-                        defender_card: None,
-                    });
-
-                    for defender_card in defender_board.iter().take(4) {
+                        let mut candidates: Vec<AttackAction> = Vec::new();
                         candidates.push(AttackAction {
                             attacker_owner: actor,
                             attacker_id: card.id,
                             defender_owner: opponent,
-                            defender_card: Some(*defender_card),
+                            defender_card: None,
                         });
-                    }
 
-                    for action in candidates {
-                        let attack_action = GameAction::Attack {
-                            action: action.clone(),
-                        };
-                        if !seen.contains(&attack_action) {
-                            match self.simulate_state(state, &attack_action) {
-                                Ok(new_state) => {
-                                    seen.push(attack_action.clone());
-                                    actions.push((attack_action, new_state));
+                        for defender_card in &defender_board {
+                            candidates.push(AttackAction {
+                                attacker_owner: actor,
+                                attacker_id: card.id,
+                                defender_owner: opponent,
+                                defender_card: Some(*defender_card),
+                            });
+                        }
+
+                        for action in candidates {
+                            let attack_action = GameAction::Attack {
+                                action: action.clone(),
+                            };
+                            if !seen.contains(&attack_action) {
+                                match self.simulate_state(state, &attack_action) {
+                                    Ok(new_state) => {
+                                        seen.push(attack_action.clone());
+                                        actions.push((attack_action, new_state));
+                                    }
+                                    Err(_) => {}
                                 }
-                                Err(_) => {}
                             }
                         }
                     }
@@ -593,23 +667,31 @@ impl AiAgent {
         match strategy {
             AiStrategy::Random => {}
             AiStrategy::Aggressive => actions.sort_by(|a, b| {
-                aggressive_score(base_state, b, player_id)
-                    .partial_cmp(&aggressive_score(base_state, a, player_id))
+                (aggressive_score(base_state, b, player_id)
+                    + learning_bias(&b.0) * LEARNING_IMPORTANCE)
+                    .partial_cmp(&(aggressive_score(base_state, a, player_id)
+                        + learning_bias(&a.0) * LEARNING_IMPORTANCE))
                     .unwrap_or(std::cmp::Ordering::Equal)
             }),
             AiStrategy::Control => actions.sort_by(|a, b| {
-                control_score(base_state, b, player_id)
-                    .partial_cmp(&control_score(base_state, a, player_id))
+                (control_score(base_state, b, player_id)
+                    + learning_bias(&b.0) * LEARNING_IMPORTANCE)
+                    .partial_cmp(&(control_score(base_state, a, player_id)
+                        + learning_bias(&a.0) * LEARNING_IMPORTANCE))
                     .unwrap_or(std::cmp::Ordering::Equal)
             }),
             AiStrategy::Combo => actions.sort_by(|a, b| {
-                combo_score(base_state, b, player_id)
-                    .partial_cmp(&combo_score(base_state, a, player_id))
+                (combo_score(base_state, b, player_id)
+                    + learning_bias(&b.0) * LEARNING_IMPORTANCE)
+                    .partial_cmp(&(combo_score(base_state, a, player_id)
+                        + learning_bias(&a.0) * LEARNING_IMPORTANCE))
                     .unwrap_or(std::cmp::Ordering::Equal)
             }),
             AiStrategy::Adaptive => actions.sort_by(|a, b| {
-                let score_b = self.evaluate(&b.1, player_id);
-                let score_a = self.evaluate(&a.1, player_id);
+                let score_b =
+                    self.evaluate(&b.1, player_id) + learning_bias(&b.0) * LEARNING_IMPORTANCE;
+                let score_a =
+                    self.evaluate(&a.1, player_id) + learning_bias(&a.0) * LEARNING_IMPORTANCE;
                 score_b
                     .partial_cmp(&score_a)
                     .unwrap_or(std::cmp::Ordering::Equal)
@@ -628,6 +710,10 @@ impl AiAgent {
             GameAction::PlayCard { action } => engine.play_card(&mut next_state, action.clone()),
             GameAction::Mulligan { action } => engine.mulligan(&mut next_state, action.clone()),
             GameAction::Attack { action } => engine.attack(&mut next_state, action.clone()),
+            GameAction::AdvancePhase => match RuleEngine::advance_phase(&mut next_state) {
+                Ok(_) => Ok(Vec::new()),
+                Err(err) => Err(err),
+            },
             GameAction::EndTurn => engine.end_turn(&mut next_state),
         };
         match result {
@@ -647,6 +733,10 @@ impl AiAgent {
             GameAction::PlayCard { action } => engine.play_card(&mut next_state, action.clone())?,
             GameAction::Mulligan { action } => engine.mulligan(&mut next_state, action.clone())?,
             GameAction::Attack { action } => engine.attack(&mut next_state, action.clone())?,
+            GameAction::AdvancePhase => {
+                RuleEngine::advance_phase(&mut next_state)?;
+                Vec::new()
+            }
             GameAction::EndTurn => engine.end_turn(&mut next_state)?,
         };
         Ok(RuleResolution::new(next_state, events))
@@ -670,7 +760,7 @@ impl AiAgent {
         let (hero_diff, board_diff, hand_diff, mana_diff, combo_value) =
             evaluation_components(state, player_id);
 
-        let weights = match self.config.strategy {
+        let mut weights = match self.config.strategy {
             AiStrategy::Aggressive => StrategyWeights {
                 hero: 3.0,
                 board: 1.2,
@@ -701,6 +791,37 @@ impl AiAgent {
                 combo: 0.3,
             },
         };
+
+        let difficulty_weights = self.config.weights;
+        weights.hero *= difficulty_weights.hero;
+        weights.board *= difficulty_weights.board;
+        weights.hand *= difficulty_weights.resources;
+        weights.mana *= difficulty_weights.resources;
+        weights.combo *= difficulty_weights.combo;
+
+        if hero_diff < 0.0 {
+            let pressure = (-hero_diff / 30.0).clamp(0.0, 0.7);
+            weights.hero *= 1.0 + pressure;
+            weights.board *= 1.0 + pressure * 0.5;
+        } else if hero_diff > 0.0 {
+            let advantage = (hero_diff / 30.0).clamp(0.0, 0.6);
+            weights.combo *= 1.0 + advantage * 0.4;
+        }
+
+        if hand_diff < 0.0 {
+            let deficit = (-hand_diff / 5.0).clamp(0.0, 0.8);
+            weights.hand *= 1.0 + deficit;
+            weights.mana *= 1.0 + deficit * 0.5;
+        } else if hand_diff > 0.0 {
+            let surplus = (hand_diff / 5.0).clamp(0.0, 0.6);
+            weights.hero *= 1.0 + surplus * 0.3;
+            weights.combo *= 1.0 + surplus * 0.3;
+        }
+
+        if mana_diff < 0.0 {
+            let mana_pressure = (-mana_diff / 3.0).clamp(0.0, 0.5);
+            weights.mana *= 1.0 + mana_pressure;
+        }
 
         let armor_bonus =
             (player.armor as f64 - opponent.map(|p| p.armor as f64).unwrap_or(0.0)) * 0.6;
@@ -860,6 +981,93 @@ fn adaptive_weights(hero_diff: f64, board_diff: f64) -> StrategyWeights {
         hand: 1.3,
         mana: 0.9,
         combo: 1.1,
+    }
+}
+
+mod learning {
+    use super::{CardId, GameAction};
+    use once_cell::sync::Lazy;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    #[derive(Hash, Eq, PartialEq, Clone, Debug)]
+    enum ActionKind {
+        PlayCard,
+        Attack,
+        Mulligan,
+        AdvancePhase,
+        EndTurn,
+    }
+
+    #[derive(Hash, Eq, PartialEq, Clone, Debug)]
+    struct ActionSignature {
+        kind: ActionKind,
+        card: Option<CardId>,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct RewardStats {
+        visits: u32,
+        average: f64,
+    }
+
+    impl RewardStats {
+        fn new() -> Self {
+            Self {
+                visits: 0,
+                average: 0.0,
+            }
+        }
+
+        fn update(&mut self, reward: f64) {
+            self.visits = (self.visits + 1).min(100);
+            let weight = 1.0 / self.visits as f64;
+            self.average += (reward - self.average) * weight;
+        }
+    }
+
+    static TABLE: Lazy<Mutex<HashMap<ActionSignature, RewardStats>>> =
+        Lazy::new(|| Mutex::new(HashMap::new()));
+
+    pub fn bias(action: &GameAction) -> f64 {
+        let signature = signature(action);
+        let table = TABLE.lock().unwrap();
+        table
+            .get(&signature)
+            .map(|stats| stats.average)
+            .unwrap_or(0.0)
+    }
+
+    pub fn record(action: &GameAction, reward: f64) {
+        let signature = signature(action);
+        let mut table = TABLE.lock().unwrap();
+        let stats = table.entry(signature).or_insert_with(RewardStats::new);
+        stats.update(reward);
+    }
+
+    fn signature(action: &GameAction) -> ActionSignature {
+        match action {
+            GameAction::PlayCard { action } => ActionSignature {
+                kind: ActionKind::PlayCard,
+                card: Some(action.card_id),
+            },
+            GameAction::Attack { action } => ActionSignature {
+                kind: ActionKind::Attack,
+                card: Some(action.attacker_id),
+            },
+            GameAction::Mulligan { .. } => ActionSignature {
+                kind: ActionKind::Mulligan,
+                card: None,
+            },
+            GameAction::AdvancePhase => ActionSignature {
+                kind: ActionKind::AdvancePhase,
+                card: None,
+            },
+            GameAction::EndTurn => ActionSignature {
+                kind: ActionKind::EndTurn,
+                card: None,
+            },
+        }
     }
 }
 

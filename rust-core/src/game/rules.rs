@@ -35,6 +35,13 @@ pub struct MulliganAction {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiscardCardAction {
+    pub player_id: PlayerId,
+    pub pending_id: u64,
+    pub discard_card_id: CardId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type")]
 pub enum RuleError {
     GameFinished,
@@ -65,10 +72,17 @@ pub enum RuleError {
     AttackerNotFound {
         card_id: CardId,
     },
+    ZeroAttackUnit {
+        card_id: CardId,
+    },
     BoardFull,
     MulliganPhaseOnly,
     MulliganAlreadyCompleted {
         player_id: PlayerId,
+    },
+    PendingDiscardNotFound {
+        player_id: PlayerId,
+        pending_id: u64,
     },
     IntegrityViolation {
         error: IntegrityError,
@@ -193,6 +207,46 @@ impl RuleEngine {
             }
         }
         ctx
+    }
+
+    fn process_turn_start(
+        &mut self,
+        state: &mut GameState,
+        player_id: PlayerId,
+    ) -> Result<Vec<GameEvent>, RuleError> {
+        state.current_player = player_id;
+        state.phase = GamePhase::Main;
+
+        Self::ensure_integrity(state)?;
+
+        let mut events = Vec::new();
+
+        if let Some(index) = state.player_index(player_id) {
+            let board_snapshot: Vec<Card> = state.players[index].board.clone();
+            for card in &board_snapshot {
+                let ctx = EffectContext::new(EffectTrigger::OnTurnStart, player_id, state.current_player)
+                    .with_source_card(card.id);
+                self.effect_engine.queue_card_effects(card, ctx);
+            }
+        }
+
+        let mut trigger_events = self.effect_engine.resolve_all(state);
+        events.append(&mut trigger_events);
+
+        if state.is_finished() {
+            return Ok(events);
+        }
+
+        state.ready_player(player_id);
+
+        if let Some(outcome) = state.evaluate_victory() {
+            events.push(GameEvent::GameWon {
+                winner: outcome.winner,
+                reason: outcome.reason.clone(),
+            });
+        }
+
+        Ok(events)
     }
 
     pub fn play_card(
@@ -352,7 +406,9 @@ impl RuleEngine {
             });
         }
         if attacker_card_info.attack <= 0 {
-            return Err(RuleError::InvalidAttackTarget);
+            return Err(RuleError::ZeroAttackUnit {
+                card_id: attacker_card_info.id,
+            });
         }
 
         let mut events = Vec::new();
@@ -444,6 +500,69 @@ impl RuleEngine {
         Ok(events)
     }
 
+    pub fn resolve_pending_discard(
+        &mut self,
+        state: &mut GameState,
+        action: DiscardCardAction,
+    ) -> Result<Vec<GameEvent>, RuleError> {
+        if state.is_finished() {
+            return Err(RuleError::GameFinished);
+        }
+
+        Self::ensure_integrity(state)?;
+
+        let player_index = state
+            .player_index(action.player_id)
+            .ok_or(RuleError::PlayerNotFound {
+                player_id: action.player_id,
+            })?;
+
+        let pending = state
+            .take_pending_discard(action.player_id, action.pending_id)
+            .ok_or(RuleError::PendingDiscardNotFound {
+                player_id: action.player_id,
+                pending_id: action.pending_id,
+            })?;
+
+        let mut events = Vec::new();
+
+        if action.discard_card_id == pending.drawn_card.id {
+            let discard_event = GameEvent::CardDiscarded {
+                player_id: action.player_id,
+                card: pending.drawn_card,
+            };
+            state.record_event(discard_event.clone());
+            events.push(discard_event);
+            return Ok(events);
+        }
+
+        let player = &mut state.players[player_index];
+        if let Some(pos) = player.find_card_in_hand_index(action.discard_card_id) {
+            let discarded_card = player.hand.remove(pos);
+            let discard_event = GameEvent::CardDiscarded {
+                player_id: action.player_id,
+                card: discarded_card,
+            };
+            state.record_event(discard_event.clone());
+            events.push(discard_event);
+
+            player.hand.push(pending.drawn_card.clone());
+            let draw_event = GameEvent::CardDrawn {
+                player_id: action.player_id,
+                card_id: pending.drawn_card.id,
+            };
+            state.record_event(draw_event.clone());
+            events.push(draw_event);
+
+            Ok(events)
+        } else {
+            state.pending_discards.push(pending);
+            Err(RuleError::CardNotFound {
+                card_id: action.discard_card_id,
+            })
+        }
+    }
+
     pub fn mulligan(
         &mut self,
         state: &mut GameState,
@@ -524,37 +643,11 @@ impl RuleEngine {
             return Err(RuleError::GameFinished);
         }
         Self::ensure_integrity(state)?;
-
-        // 设置当前玩家和阶段，但不立即准备玩家
-        state.current_player = player_id;
-        state.phase = GamePhase::Main;
-
-        let mut events = Vec::new();
-
-        // 先触发OnTurnStart效果
-        if let Some(index) = state.player_index(player_id) {
-            let board_snapshot: Vec<Card> = state.players[index].board.clone();
-            for card in &board_snapshot {
-                let ctx =
-                    EffectContext::new(EffectTrigger::OnTurnStart, player_id, state.current_player)
-                        .with_source_card(card.id);
-                self.effect_engine.queue_card_effects(card, ctx);
-            }
-            let mut trigger_events = self.effect_engine.resolve_all(state);
-            events.append(&mut trigger_events);
+        if state.player_index(player_id).is_none() {
+            return Err(RuleError::PlayerNotFound { player_id });
         }
 
-        // 然后才准备玩家（抽牌、恢复法力等）
-        state.ready_player(player_id);
-
-        if let Some(outcome) = state.evaluate_victory() {
-            events.push(GameEvent::GameWon {
-                winner: outcome.winner,
-                reason: outcome.reason.clone(),
-            });
-        }
-
-        Ok(events)
+        self.process_turn_start(state, player_id)
     }
 
     pub fn end_turn(&mut self, state: &mut GameState) -> Result<Vec<GameEvent>, RuleError> {
@@ -583,13 +676,26 @@ impl RuleEngine {
         state.record_event(end_event.clone());
         events.push(end_event);
 
-        state.end_turn();
-
         if let Some(outcome) = state.evaluate_victory() {
             events.push(GameEvent::GameWon {
                 winner: outcome.winner,
                 reason: outcome.reason.clone(),
             });
+            return Ok(events);
+        }
+
+        let next_player = state.opponent_of(current);
+        state.end_turn();
+
+        if state.is_finished() {
+            return Ok(events);
+        }
+
+        if let Some(next_player) = next_player {
+            if state.player_index(next_player).is_some() {
+                let mut start_events = self.process_turn_start(state, next_player)?;
+                events.append(&mut start_events);
+            }
         }
 
         Ok(events)
@@ -688,6 +794,62 @@ mod tests {
         assert!(
             attacker_after < 2,
             "attacker should also take retaliation damage"
+        );
+    }
+
+    #[test]
+    fn end_turn_triggers_next_player_start_effects() {
+        let mut engine = RuleEngine::new();
+
+        let healer_effect = CardEffect::heal(
+            9001,
+            "Healer",
+            EffectTrigger::OnTurnStart,
+            1,
+            2,
+            EffectTarget::SourcePlayer,
+        );
+
+        let mut healer = Card::new(100, "Turn Healer", 2, 2, 3, CardType::Unit, vec![healer_effect]);
+        healer.exhausted = true;
+
+        let deck_card_one = Card::new(101, "Deck Filler A", 1, 1, 1, CardType::Unit, Vec::new());
+        let deck_card_two = Card::new(102, "Deck Filler B", 1, 1, 1, CardType::Unit, Vec::new());
+
+        let player_one = Player::new(0, 30, 0, 3, Vec::new(), Vec::new(), vec![deck_card_one]);
+        let player_two = Player::new(1, 25, 0, 3, Vec::new(), vec![healer.clone()], vec![deck_card_two]);
+
+        let mut state = GameState::new(vec![player_one, player_two], 0).with_phase(GamePhase::Main);
+
+        let events = engine
+            .end_turn(&mut state)
+            .expect("end_turn should succeed and start next turn");
+
+        assert_eq!(state.current_player, 1, "turn should pass to next player");
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                GameEvent::CardHealed {
+                    player_id: 1,
+                    card_id: None,
+                    amount: 2
+                }
+            )),
+            "start-of-turn heal should trigger"
+        );
+
+        let player_two_state = state.get_player(1).expect("player two should exist");
+        assert!(
+            player_two_state
+                .board
+                .iter()
+                .all(|card| !card.exhausted),
+            "board units should be refreshed"
+        );
+        assert_eq!(
+            player_two_state.hand.len(),
+            1,
+            "next player should draw a card on turn start"
         );
     }
 }

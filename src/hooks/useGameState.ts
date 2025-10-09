@@ -8,7 +8,8 @@ import type {
   PlayCardAction,
   AttackAction,
   MulliganAction,
-  RuleResolution
+  RuleResolution,
+  DiscardCardAction,
 } from "@/types/domain";
 import type { ApplyAiOptions, GameEngineService, ThinkAiOptions } from "@/wasm/GameEngineService";
 import { gameEventBus, type CanvasInteractionEvent } from "@/events/GameEvents";
@@ -22,6 +23,13 @@ const clone = <T,>(value: T): T => {
 
 type UpdateMode = "replace" | "incremental";
 
+export interface GameStateError {
+  code: string;
+  message: string;
+  raw: Error;
+  details?: Record<string, unknown>;
+}
+
 export interface UseGameStateOptions {
   service: GameEngineService | null;
   updateMode?: UpdateMode;
@@ -32,22 +40,25 @@ export interface UseGameStateResult {
   state: GameState | null;
   events: GameEvent[];
   loading: boolean;
-  error: Error | null;
+  error: GameStateError | null;
   isMutating: boolean;
   updateMode: UpdateMode;
   setUpdateMode: (mode: UpdateMode) => void;
   reload: () => Promise<void>;
   clearEvents: () => void;
+  clearHistory: () => void;
   rollback: () => GameState | null;
   playCard: (action: PlayCardAction) => Promise<RuleResolution>;
   mulligan: (action: MulliganAction) => Promise<RuleResolution>;
   attack: (action: AttackAction) => Promise<RuleResolution>;
+  resolveDiscard: (action: DiscardCardAction) => Promise<RuleResolution>;
   startTurn: (playerId: number) => Promise<RuleResolution>;
   endTurn: () => Promise<RuleResolution>;
   advancePhase: () => Promise<RuleResolution>;
   applyAiMove: (playerId: number, options?: ApplyAiOptions) => Promise<AiMoveResponse>;
   thinkAi: (playerId: number, options?: ThinkAiOptions) => Promise<AiDecision>;
   computeAiMove: (state: GameState, playerId: number, options?: ApplyAiOptions) => Promise<AiDecision>;
+  formatError: (error: unknown) => GameStateError;
 }
 
 const shallowEqualCard = (a: unknown, b: unknown): boolean => {
@@ -84,6 +95,14 @@ const shallowEqualPlayer = (a: unknown, b: unknown): boolean => {
 const reconcileState = (prev: GameState | null, next: GameState, mode: UpdateMode): GameState => {
   if (!prev || mode === "replace") {
     return next;
+  }
+
+  if (
+    typeof prev.version === "number" &&
+    typeof next.version === "number" &&
+    next.version <= prev.version
+  ) {
+    return prev;
   }
 
   const reconciledPlayers = next.players.map((player, index) => {
@@ -148,14 +167,97 @@ const reconcileCardArray = (prev: unknown, next: unknown): unknown => {
   return unchanged ? prev : result;
 };
 
-const normalizeError = (error: unknown): Error => {
+type RuleErrorPayload = {
+  type: string;
+} & Record<string, unknown>;
+
+const RULE_ERROR_MESSAGES: Record<string, (payload: RuleErrorPayload) => string> = {
+  GameFinished: () => "对局已结束",
+  NotPlayerTurn: () => "现在不是你的回合",
+  PlayerNotFound: (payload) => `找不到编号 ${payload.player_id ?? "未知"} 的玩家`,
+  InvalidPhase: (payload) =>
+    `当前阶段为 ${payload.actual ?? "未知"}，需要 ${payload.expected ?? "指定阶段"}`,
+  CardNotFound: (payload) => `无法找到卡牌 #${payload.card_id ?? "?"}`,
+  InvalidTarget: () => "无效的目标",
+  InsufficientMana: (payload) =>
+    `法力不足（需要 ${payload.required ?? "?"}，当前 ${payload.available ?? "?"}）`,
+  CardTypeMismatch: (payload) =>
+    `卡牌类型不符合要求（需要 ${payload.expected ?? "指定类型"}）`,
+  UnitExhausted: () => "该单位已经攻击过了",
+  InvalidAttackTarget: () => "无法攻击该目标",
+  AttackerNotFound: () => "攻击者不存在或已被移除",
+  ZeroAttackUnit: () => "该单位无法攻击",
+  BoardFull: () => "战场已满，无法部署更多单位",
+  MulliganPhaseOnly: () => "仅在调度阶段允许该操作",
+  MulliganAlreadyCompleted: () => "你已完成调度",
+  PendingDiscardNotFound: () => "当前没有待处理的弃牌请求",
+  IntegrityViolation: () => "状态校验失败，请刷新或回滚",
+};
+
+const ensureError = (error: unknown): Error => {
   if (error instanceof Error) {
     return error;
   }
   if (typeof error === "string") {
     return new Error(error);
   }
-  return new Error("GameEngine operation failed");
+  try {
+    return new Error(JSON.stringify(error));
+  } catch {
+    return new Error(String(error));
+  }
+};
+
+const parseRuleErrorPayload = (message: string): RuleErrorPayload | null => {
+  if (!message) {
+    return null;
+  }
+  const trimmed = message.trim();
+  if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(trimmed) as RuleErrorPayload;
+    if (parsed && typeof parsed.type === "string") {
+      return parsed;
+    }
+  } catch {
+    return null;
+  }
+  return null;
+};
+
+const isGameStateError = (value: unknown): value is GameStateError => {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+  const candidate = value as Partial<GameStateError>;
+  return (
+    typeof candidate.code === "string" &&
+    typeof candidate.message === "string" &&
+    candidate.raw instanceof Error
+  );
+};
+
+const formatRuleError = (error: unknown): GameStateError => {
+  if (isGameStateError(error)) {
+    return error;
+  }
+  const raw = ensureError(error);
+  const payload = parseRuleErrorPayload(raw.message);
+  const code = payload?.type ?? "GeneralError";
+  const translator = payload?.type ? RULE_ERROR_MESSAGES[payload.type] : undefined;
+  let message = raw.message || "发生未知错误";
+  if (payload?.type) {
+    message = translator ? translator(payload) : payload.type;
+  }
+
+  return {
+    code,
+    message,
+    raw,
+    details: payload ?? undefined,
+  };
 };
 
 export function useGameState(options: UseGameStateOptions): UseGameStateResult {
@@ -165,13 +267,14 @@ export function useGameState(options: UseGameStateOptions): UseGameStateResult {
   const [state, setState] = useState<GameState | null>(null);
   const [events, setEvents] = useState<GameEvent[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
-  const [error, setError] = useState<Error | null>(null);
+  const [error, setError] = useState<GameStateError | null>(null);
   const [isMutating, setIsMutating] = useState<boolean>(false);
 
   const historyRef = useRef<GameState[]>([]);
   const stateRef = useRef<GameState | null>(null);
 
   const updateMode = updateModeState;
+  const formatError = useCallback((value: unknown) => formatRuleError(value), []);
 
   const setUpdateMode = useCallback(
     (mode: UpdateMode) => {
@@ -203,7 +306,7 @@ export function useGameState(options: UseGameStateOptions): UseGameStateResult {
       bus.emit("state:initialized", { state: current });
       bus.emit("canvas:invalidate", { reason: "service:attached", state: current });
     } catch (err) {
-      setError(normalizeError(err));
+      setError(formatRuleError(err));
       setLoading(false);
     }
   }, [bus, service]);
@@ -289,7 +392,7 @@ export function useGameState(options: UseGameStateOptions): UseGameStateResult {
             return snapshot;
           });
         }
-        const normalized = normalizeError(err);
+        const normalized = formatRuleError(err);
         setError(normalized);
         bus.emit("state:error", { error: normalized });
         throw normalized;
@@ -312,6 +415,12 @@ export function useGameState(options: UseGameStateOptions): UseGameStateResult {
 
   const attack = useCallback(
     (action: AttackAction) => runResolution("attack", () => service!.attack(action)),
+    [runResolution, service]
+  );
+
+  const resolveDiscard = useCallback(
+    (action: DiscardCardAction) =>
+      runResolution("resolve_discard", () => service!.resolvePendingDiscard(action)),
     [runResolution, service]
   );
 
@@ -354,7 +463,7 @@ export function useGameState(options: UseGameStateOptions): UseGameStateResult {
             return snapshot;
           });
         }
-        const normalized = normalizeError(err);
+        const normalized = formatRuleError(err);
         setError(normalized);
         bus.emit("state:error", { error: normalized });
         throw normalized;
@@ -371,7 +480,7 @@ export function useGameState(options: UseGameStateOptions): UseGameStateResult {
         return Promise.reject(new Error("GameEngineService is not available"));
       }
       return service.thinkAi(playerId, opts).catch((error) => {
-        const normalized = normalizeError(error);
+        const normalized = formatRuleError(error);
         setError(normalized);
         bus.emit("state:error", { error: normalized });
         throw normalized;
@@ -386,7 +495,7 @@ export function useGameState(options: UseGameStateOptions): UseGameStateResult {
         return Promise.reject(new Error("GameEngineService is not available"));
       }
       return service.computeAiMove(currentState, playerId, opts).catch((error) => {
-        const normalized = normalizeError(error);
+        const normalized = formatRuleError(error);
         setError(normalized);
         bus.emit("state:error", { error: normalized });
         throw normalized;
@@ -400,7 +509,7 @@ export function useGameState(options: UseGameStateOptions): UseGameStateResult {
       return;
     }
     const unsubscribe = bus.on("canvas:interaction", (interaction) => {
-      const handleResult = (success: boolean, error?: Error) => {
+      const handleResult = (success: boolean, error?: GameStateError) => {
         bus.emit("canvas:actionResult", {
           type: interaction.type,
           success,
@@ -412,25 +521,25 @@ export function useGameState(options: UseGameStateOptions): UseGameStateResult {
         case "playCard":
           void playCard(interaction.action)
             .then(() => handleResult(true))
-            .catch((err) => handleResult(false, normalizeError(err)));
+            .catch((err) => handleResult(false, formatRuleError(err)));
           break;
         case "attack":
           void attack(interaction.action)
             .then(() => handleResult(true))
-            .catch((err) => handleResult(false, normalizeError(err)));
+            .catch((err) => handleResult(false, formatRuleError(err)));
           break;
         case "endTurn":
           void endTurn()
             .then(() => handleResult(true))
-            .catch((err) => handleResult(false, normalizeError(err)));
+            .catch((err) => handleResult(false, formatRuleError(err)));
           break;
         case "startTurn":
           void startTurn(interaction.playerId)
             .then(() => handleResult(true))
-            .catch((err) => handleResult(false, normalizeError(err)));
+            .catch((err) => handleResult(false, formatRuleError(err)));
           break;
         default:
-          handleResult(false, new Error(`Unhandled interaction: ${interaction.type}`));
+          handleResult(false, formatRuleError(new Error(`Unhandled interaction: ${interaction.type}`)));
           break;
       }
     });
@@ -455,7 +564,7 @@ export function useGameState(options: UseGameStateOptions): UseGameStateResult {
       bus.emit("state:initialized", { state: next });
       bus.emit("canvas:invalidate", { reason: "state:reloaded", state: next });
     } catch (err) {
-      const normalized = normalizeError(err);
+      const normalized = formatRuleError(err);
       setError(normalized);
       bus.emit("state:error", { error: normalized });
     } finally {
@@ -469,6 +578,11 @@ export function useGameState(options: UseGameStateOptions): UseGameStateResult {
     bus.emit("canvas:invalidate", { reason: "events:cleared", state: stateRef.current });
   }, [bus]);
 
+  const clearHistory = useCallback(() => {
+    historyRef.current = [];
+    bus.emit("canvas:invalidate", { reason: "history:cleared", state: stateRef.current });
+  }, [bus]);
+
   return useMemo(
     () => ({
       state,
@@ -480,6 +594,7 @@ export function useGameState(options: UseGameStateOptions): UseGameStateResult {
       setUpdateMode,
       reload,
       clearEvents,
+      clearHistory,
       rollback,
       playCard,
       mulligan,
@@ -487,9 +602,11 @@ export function useGameState(options: UseGameStateOptions): UseGameStateResult {
       startTurn,
       endTurn,
       advancePhase,
+      resolveDiscard,
       applyAiMove,
       thinkAi,
       computeAiMove,
+      formatError,
     }),
     [
       state,
@@ -501,6 +618,7 @@ export function useGameState(options: UseGameStateOptions): UseGameStateResult {
       setUpdateMode,
       reload,
       clearEvents,
+      clearHistory,
       rollback,
       playCard,
       mulligan,
@@ -508,9 +626,11 @@ export function useGameState(options: UseGameStateOptions): UseGameStateResult {
       startTurn,
       endTurn,
       advancePhase,
+      resolveDiscard,
       applyAiMove,
       thinkAi,
       computeAiMove,
+      formatError,
     ]
   );
 }
